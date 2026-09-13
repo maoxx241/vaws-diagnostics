@@ -34,12 +34,14 @@ class Outbox:
                     state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
                     lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
-                    diagnosis TEXT, diagnosis_state TEXT NOT NULL DEFAULT 'pending');
+                    diagnosis TEXT, diagnosis_state TEXT NOT NULL DEFAULT 'pending', consent TEXT);
                 CREATE TABLE IF NOT EXISTS seen (
                     operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS publications (at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS generations (at REAL NOT NULL);
             """)
+            if 'consent' not in {row[1] for row in db.execute('PRAGMA table_info(incidents)')}:
+                raise ValueError('unsupported diagnostic queue schema; use a fresh state directory')
 
     @contextmanager
     def connect(self):
@@ -52,10 +54,13 @@ class Outbox:
         finally:
             db.close()
 
-    def enqueue(self, fingerprint: str, operation_id: str, payload: dict[str, Any]) -> bool:
+    def enqueue(self, fingerprint: str, operation_id: str, payload: dict[str, Any], *, consent=None) -> bool:
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if len(body.encode()) > 48000:
             raise ValueError("diagnostic issue payload exceeds 48000 bytes")
+        reference = json.dumps(consent, ensure_ascii=True, separators=(",", ":")) if consent is not None else None
+        if reference is not None and len(reference.encode()) > 8192:
+            raise ValueError("community reference exceeds limit")
         now = self.clock()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -69,9 +74,9 @@ class Outbox:
             if existing:
                 db.execute("UPDATE incidents SET last_seen=?, occurrences=occurrences+1 WHERE fingerprint=?", (now, fingerprint))
             else:
-                if db.execute("SELECT COUNT(*) FROM incidents WHERE state!='published'").fetchone()[0] >= self.capacity:
+                if db.execute("SELECT COUNT(*) FROM incidents WHERE state NOT IN ('published','withdrawn')").fetchone()[0] >= self.capacity:
                     raise QueueFull("diagnostic outbox is full; retained incidents were not discarded")
-                db.execute("INSERT INTO incidents (fingerprint,payload,first_seen,last_seen) VALUES (?,?,?,?)", (fingerprint, body, now, now))
+                db.execute("INSERT INTO incidents (fingerprint,payload,first_seen,last_seen,consent) VALUES (?,?,?,?,?)", (fingerprint, body, now, now, reference))
             db.execute("INSERT INTO seen VALUES (?,?)", (operation_id, now))
             db.execute("DELETE FROM seen WHERE operation_id IN "
                        "(SELECT operation_id FROM seen ORDER BY observed DESC, operation_id DESC LIMIT -1 OFFSET ?)",
@@ -79,11 +84,12 @@ class Outbox:
         return True
 
     def _prune_published(self, db, now):
-        # Completed public records are recoverable from their remote markers;
-        # unpublished evidence must never be evicted to make intake space.
-        db.execute("DELETE FROM incidents WHERE state='published' AND last_seen < ?", (now - 30 * 86400,))
+        # Public markers are recoverable remotely. Withdrawn items can never
+        # resume; bounded local history prevents revocation filling the queue.
+        # Active unpublished evidence is never evicted to make intake space.
+        db.execute("DELETE FROM incidents WHERE state IN ('published','withdrawn') AND last_seen < ?", (now - 30 * 86400,))
         db.execute("DELETE FROM incidents WHERE fingerprint IN "
-                   "(SELECT fingerprint FROM incidents WHERE state='published' "
+                   "(SELECT fingerprint FROM incidents WHERE state IN ('published','withdrawn') "
                    "ORDER BY last_seen DESC, fingerprint DESC LIMIT -1 OFFSET ?)", (self.capacity,))
 
     def claim(self, *, lease_seconds: float = 300) -> dict[str, Any] | None:
@@ -95,7 +101,44 @@ class Outbox:
             if row is None:
                 return None
             db.execute("UPDATE incidents SET lease_until=?, lease_token=? WHERE fingerprint=?", (now + lease_seconds, token, row['fingerprint']))
-        return {**dict(row), "lease_token": token, "payload": json.loads(row["payload"])}
+        return {**dict(row), "lease_token": token, "payload": json.loads(row["payload"]),
+                "consent": self._consent(row["consent"])}
+
+    @staticmethod
+    def _consent(raw):
+        try:
+            return json.loads(raw) if raw else None
+        except (ValueError, TypeError):
+            return None
+
+    def withdraw_unconsented(self) -> int:
+        """Revoke queued work before intake; retain bounded local history.
+
+        This includes entries with no explicit scope. Leases are fenced so an
+        overlapping worker cannot publish a revoked item after generation.
+        """
+        from .community import consent_allowed
+        with self.connect() as db:
+            rows = db.execute("SELECT fingerprint,consent,state FROM incidents WHERE state!='withdrawn'").fetchall()
+        checked, withdrawn = {}, 0
+        for row in rows:
+            raw = row['consent']
+            if raw not in checked:
+                checked[raw] = consent_allowed(self._consent(raw))
+            if checked[raw]:
+                continue
+            with self.connect() as db:
+                if row['state'] == 'published':
+                    changed = db.execute("UPDATE incidents SET diagnosis_state='withdrawn',lease_until=0,lease_token=NULL "
+                                         "WHERE fingerprint=? AND diagnosis_state!='withdrawn'", (row['fingerprint'],))
+                else:
+                    changed = db.execute("UPDATE incidents SET state='withdrawn',diagnosis_state='withdrawn',"
+                                         "last_error='community_consent_unavailable_or_withdrawn',lease_until=0,lease_token=NULL "
+                                         "WHERE fingerprint=? AND state!='withdrawn'", (row['fingerprint'],))
+                withdrawn += changed.rowcount
+        with self.connect() as db:
+            self._prune_published(db, self.clock())
+        return withdrawn
 
     def update(self, item: dict[str, Any], **fields: Any) -> None:
         allowed = {"state", "attempts", "next_attempt", "issue_number", "issue_url", "last_error", "diagnosis", "diagnosis_state"}
@@ -141,4 +184,5 @@ class Outbox:
 
     def published(self, *, limit: int = 10) -> list[dict[str, Any]]:
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM incidents WHERE state='published' AND diagnosis_state!='published' ORDER BY first_seen LIMIT ?", (min(limit, 100),))]
+            return [{**dict(row), 'consent': self._consent(row['consent'])}
+                    for row in db.execute("SELECT * FROM incidents WHERE state='published' AND diagnosis_state='pending' ORDER BY first_seen LIMIT ?", (min(limit, 100),))]

@@ -10,6 +10,7 @@ import re
 
 from .bundle import _safe_open, collect_bundle, export_public_event
 from .outbox import Outbox
+from .community import consent_allowed, scope_key
 
 _FILE = re.compile(r"\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 
@@ -49,11 +50,9 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
     root = Path(root).absolute()
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise ValueError('diagnostic root must not traverse symlinks')
-    counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0, 'before_start': 0}
+    counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0, 'before_start': 0, 'consent_skipped': 0}
     with queue.connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, inode TEXT, offset INTEGER, touched REAL, discard INTEGER DEFAULT 0)')
-        if 'discard' not in {row[1] for row in db.execute('PRAGMA table_info(cursors)')}:
-            db.execute('ALTER TABLE cursors ADD COLUMN discard INTEGER DEFAULT 0')
         db.execute('DELETE FROM cursors WHERE touched < ?', (queue.clock() - 30 * 86400,))
         db.execute('DELETE FROM cursors WHERE path IN (SELECT path FROM cursors ORDER BY touched DESC LIMIT -1 OFFSET 10000)')
         cursors = {row['path']: dict(row) for row in db.execute('SELECT * FROM cursors')}
@@ -109,7 +108,10 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                     if since is not None and datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp() < since:
                         counts['before_start'] += 1
                         continue
-                    recent.append(event)
+                    consent = raw.get('community')
+                    # Older unscoped logs stay local. Enabling a workspace later
+                    # must never backfill logs produced without that consent.
+                    recent.append((event, consent))
                     if event.get('event') != 'operation.end' or event.get('status') != 'error':
                         continue
                     attributes = event.get('attributes', {})
@@ -117,11 +119,16 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                             or attributes.get('classification') in {'caller', 'cancelled'}):
                         counts['caller_errors'] += 1
                         continue
-                    records = [row for row in recent if row['operation_id'] == event['operation_id']]
+                    if not consent_allowed(consent):
+                        counts['consent_skipped'] += 1
+                        continue
+                    records = [row for row, scope in recent if scope == consent and row['operation_id'] == event['operation_id']]
                     bundle = collect_bundle(root, operation_id=event['operation_id'], records=records,
                                             include_logs=False, max_bytes=36000)
                     payload = issue_payload(bundle)
-                    counts['enqueued'] += int(queue.enqueue(fingerprint(payload), event['operation_id'], payload))
+                    counts['enqueued'] += int(queue.enqueue(scope_key(fingerprint(payload), consent),
+                                                            scope_key(event['operation_id'], consent),
+                                                            payload, consent=consent))
                 except (ValueError, KeyError, TypeError):
                     counts['invalid'] += 1
             with queue.connect() as db:

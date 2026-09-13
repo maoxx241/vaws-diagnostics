@@ -19,7 +19,7 @@ def test_retention_preserves_fresh_and_unrelated_files(tmp_path):
     assert result['removed_files'] == 1 and result['limited']
 
 
-def test_worker_retention_preserves_unread_old_evidence(tmp_path):
+def test_worker_retention_preserves_unread_old_evidence(tmp_path, community_consent):
     from vaws_diagnostics import configure
     from vaws_diagnostics.ingestion import ingest
     from vaws_diagnostics.outbox import Outbox

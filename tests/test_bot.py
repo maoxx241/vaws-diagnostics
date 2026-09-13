@@ -6,6 +6,9 @@ import pytest
 from vaws_diagnostics.bot import Grok, diagnose_one
 from vaws_diagnostics.outbox import Outbox
 from vaws_diagnostics.reporter import TransportError
+from vaws_diagnostics.community import current_consent
+
+pytestmark = pytest.mark.usefixtures('community_consent')
 
 
 def test_profile_with_hooks_is_rejected_before_model_call(tmp_path, monkeypatch):
@@ -45,7 +48,7 @@ def test_comment_lost_reply_reconciles_without_model_rerun(tmp_path, monkeypatch
     monkeypatch.setattr('vaws_diagnostics.bot.sanitize_diagnosis', lambda text: text)
     now = [1000.0]
     queue = Outbox(tmp_path / 'bot.db', clock=lambda: now[0])
-    queue.enqueue('a', 'o', {'issue_number': 1, 'evidence': {}})
+    queue.enqueue('a', 'o', {'issue_number': 1, 'evidence': {}}, consent=current_consent())
     class Model:
         calls = 0
         def diagnose(self, _):
