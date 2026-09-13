@@ -115,7 +115,7 @@ def _loaded_properties(runner):
     return reply, facts
 
 
-def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False):
+def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False, repair=False):
     reply, facts = _loaded_properties(runner)
     if facts.get("DropInPaths"):
         raise ServiceError("unowned_unit_override")
@@ -124,6 +124,9 @@ def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False):
         raise ServiceError("unowned_loaded_unit")
     if creating and facts.get("LoadState") == "loaded":
         raise ServiceError("unowned_loaded_unit")
+    if (repair and not creating and reply.returncode == 0 and fragment
+            and facts.get('LoadState') == 'bad-setting' and _read_owned(path) is not None):
+        return  # Our exact marked fragment can be repaired; no foreign drop-ins.
     if allow_missing and facts.get("LoadState") == "not-found" and reply.returncode in (0, 1, 4):
         return
     if reply.returncode or facts.get("LoadState") not in {"loaded", "not-found"}:
@@ -241,7 +244,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         existing = _read_owned(path)
         fixed_since = existing[1]["since"] if existing else _since(since)
         interpreter, version = _interpreter(runner, python)
-        _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None)
+        _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
+                            repair=existing is not None)
         argv = [str(interpreter), "-I", "-m", "vaws_diagnostics.cli", "worker"]
         for root in dict.fromkeys(roots):
             argv += ["--root", str(root)]
@@ -310,7 +314,7 @@ def remove_service(*, unit_dir=None, runner=None):
         existing = _read_owned(path)
         if existing is None:
             return {"status": "absent", "unit": str(path)}
-        _check_loaded_owner(runner, path, allow_missing=True)
+        _check_loaded_owner(runner, path, allow_missing=True, repair=True)
         _systemctl(runner, "disable", "--now", UNIT)
         if _read_owned(path) != existing:
             raise ServiceError("unit_changed_during_removal")

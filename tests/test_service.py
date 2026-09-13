@@ -104,6 +104,29 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
     assert started['since'] == first['since'] and path.read_bytes() == previous
 
 
+def test_reinstall_repairs_own_invalid_unit_but_never_foreign_overrides(install):
+    values, runner = install
+    first = service.install_service(**values)
+    path = Path(first['unit'])
+    path.write_text(path.read_text().replace('WorkingDirectory=/', 'WorkingDirectory="/invalid"'))
+    class InvalidBeforeReload:
+        def __init__(self):
+            self.reloaded = False
+        def __call__(self, argv, **options):
+            if argv[:3] == ['systemctl', '--user', 'daemon-reload']:
+                self.reloaded = True
+            reply = runner(argv, **options)
+            if argv[:3] == ['systemctl', '--user', 'show'] and not self.reloaded:
+                reply.stdout = reply.stdout.replace('LoadState=loaded', 'LoadState=bad-setting')
+            return reply
+    result = service.install_service(**{**values, 'runner': InvalidBeforeReload()})
+    assert result['changed'] and result['since'] == first['since']
+    assert '\nWorkingDirectory=/\n' in path.read_text()
+    runner.dropins = '/personal/override.conf'
+    with pytest.raises(service.ServiceError, match='unowned_unit_override'):
+        service.install_service(**{**values, 'runner': InvalidBeforeReload()})
+
+
 def test_personal_unit_is_never_overwritten_or_stopped(install):
     values, runner = install
     path = values['unit_dir'] / service.UNIT
