@@ -108,6 +108,66 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
     assert started['since'] == first['since'] and path.read_bytes() == previous
 
 
+def test_ensure_two_clones_retains_roots_state_auth_and_model_profile(install, monkeypatch):
+    from vaws_diagnostics.service_config import linux_worker_configuration, worker_options
+    values, runner = install
+    first = service.ensure_reporter_service(**values, grok=values['gh'],
+                                            grok_home=values['state'] / 'grok', grok_work=values['state'] / 'work')
+    old_state = values['state'] / 'queue.sqlite3'
+    old_state.write_bytes(b'pending private state')
+    monkeypatch.setenv('GH_TOKEN', 'new-clone-token-must-not-replace-existing-login')
+    second_root = values['state'].parent / 'second clone logs'
+    second_values = {**values, 'roots': [second_root], 'state': values['state'].parent / 'unused state',
+                     'gh': '/unused/github', 'save_token': True}
+    second = service.ensure_reporter_service(**second_values)
+    options = worker_options(*linux_worker_configuration(Path(second['unit']).read_text()))
+    assert options['roots'] == [str(values['roots'][0]), str(second_root)]
+    assert options['state'] == str(values['state']) and options['gh'] == str(values['gh'])
+    assert options['grok_home'] == str(values['state'] / 'grok') and options['environment_file'] is None
+    assert old_state.read_bytes() == b'pending private state'
+    assert not second_values['state'].exists()
+    monkeypatch.delenv('GH_TOKEN')
+    third = service.ensure_reporter_service(**{**second_values, 'save_token': False})
+    assert third['changed'] is False and third['since'] == first['since']
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX private credential permissions')
+def test_ensure_token_only_then_new_token_and_no_environment_preserves_credentials(install, monkeypatch):
+    from vaws_diagnostics.service_config import linux_worker_configuration, worker_options
+    values, runner = install
+    monkeypatch.setenv('GH_TOKEN', 'initial-private-fixture')
+    monkeypatch.setattr(shutil, 'which', lambda value: None)
+    values = {**values, 'gh': None}
+    first = service.ensure_reporter_service(**values, save_token=True)
+    options = worker_options(*linux_worker_configuration(Path(first['unit']).read_text()))
+    credential = Path(options['environment_file'])
+    before = credential.read_bytes()
+    assert options['gh'] == 'gh'
+    monkeypatch.setenv('GH_TOKEN', 'different-private-fixture')
+    assert service.ensure_reporter_service(**values, save_token=True)['changed'] is False
+    monkeypatch.delenv('GH_TOKEN')
+    assert service.ensure_reporter_service(**values)['changed'] is False
+    assert credential.read_bytes() == before
+
+
+def test_ensure_rejects_central_and_repository_changes_before_mutation(install):
+    values, runner = install
+    central = service.install_service(**{**values, 'roots': [], 'central_bot': True,
+        'grok': values['gh'], 'grok_home': values['state'] / 'grok', 'grok_work': values['state'] / 'work'})
+    path = Path(central['unit'])
+    before = path.read_bytes()
+    runner.calls.clear()
+    with pytest.raises(service.ServiceError, match='central_bot_is_not_a_local_reporter'):
+        service.ensure_reporter_service(**values)
+    assert path.read_bytes() == before and runner.calls == []
+    service.install_service(**values)
+    before = path.read_bytes()
+    runner.calls.clear()
+    with pytest.raises(service.ServiceError, match='reporter_repository_mismatch'):
+        service.ensure_reporter_service(**{**values, 'repository': 'another/repository'})
+    assert path.read_bytes() == before and runner.calls == []
+
+
 def test_reinstall_repairs_own_invalid_unit_but_never_foreign_overrides(install):
     values, runner = install
     first = service.install_service(**values)

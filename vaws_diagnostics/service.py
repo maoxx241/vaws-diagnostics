@@ -242,7 +242,8 @@ def _publish(path, text, runner):
 
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
                     grok_home=None, grok_work=None, interval=60, since=None,
-                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False):
+                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False,
+                    ensure=False):
     """Install/update the owned unit, preserving the first installation's since.
 
     ``start=False`` writes/enables it without starting or restarting a process.
@@ -253,10 +254,12 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         return install_native(roots, state, repository, python=python, gh=gh, grok=grok,
                               grok_home=grok_home, grok_work=grok_work, interval=interval, since=since,
                               environment_file=environment_file, unit_dir=unit_dir, runner=runner, start=start,
-                              save_token=save_token, central_bot=central_bot)
+                              save_token=save_token, central_bot=central_bot, ensure=ensure)
     _linux()
     runner = runner or subprocess.run
     path = _unit_path(unit_dir)
+    if ensure and central_bot:
+        raise ServiceError('central_bot_is_not_a_local_reporter')
     roots = [_absolute(root) for root in roots]
     if central_bot and roots:
         raise ServiceError("central_bot_does_not_watch_local_logs")
@@ -271,24 +274,35 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         raise ServiceError("invalid_interval")
     if bool(grok) != bool(grok_home and grok_work) or ((grok_home or grok_work) and not grok):
         raise ServiceError("grok_profile_required")
-    if save_token:
-        if environment_file is not None:
-            raise ServiceError("choose_existing_file_or_save_token")
-        from .platform_service import save_environment_token
-        environment_file = save_environment_token(state, runner)
-    environment_file = _environment_file(environment_file) if environment_file is not None else None
+    if save_token and environment_file is not None:
+        raise ServiceError("choose_existing_file_or_save_token")
     with _locked(path):
         existing = _read_owned(path)
+        if ensure and existing:
+            from .service_config import linux_worker_configuration, merged_reporter_options
+            old_argv, old_environment = linux_worker_configuration(existing[0])
+            retained = merged_reporter_options(old_argv, old_environment, roots, repository)
+            roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
+            environment_file = retained['environment_file']
+            save_token = False  # Onboarding never rotates another clone's authentication.
+            grok, grok_home, grok_work = (retained[key] for key in ('grok', 'grok_home', 'grok_work'))
+            interval = retained['interval']
         fixed_since = existing[1]["since"] if existing else _since(since)
         interpreter, version = _interpreter(runner, python)
         _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
                             repair=existing is not None)
+        if save_token:
+            from .platform_service import save_environment_token
+            environment_file = save_environment_token(state, runner)
+        environment_file = _environment_file(environment_file) if environment_file is not None else None
+        gh_path = (str(_executable(gh)) if ensure and existing and environment_file is None
+                   else _reporter_executable(gh, environment_file))
         argv = [str(interpreter), "-I", "-m", "vaws_diagnostics.cli", "worker"]
         if central_bot:
             argv.append("--central-bot")
         for root in dict.fromkeys(roots):
             argv += ["--root", str(root)]
-        argv += ["--state", str(state), "--repository", repository, "--gh", _reporter_executable(gh, environment_file),
+        argv += ["--state", str(state), "--repository", repository, "--gh", gh_path,
                  "--since", fixed_since, "--interval", str(interval)]
         if grok:
             argv += ["--grok", str(_executable(grok)), "--grok-home", str(_absolute(grok_home)),
@@ -315,6 +329,16 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         return {"status": "installed", "unit": str(path), "since": fixed_since,
                 "changed": changed, "start_requested": start, "python": str(interpreter),
                 "package_version": version, "state": str(state), "unit_verification": verification}
+
+
+def ensure_reporter_service(roots, state, repository, **options):
+    """Add log roots to the owned local reporter, preserving its durable setup.
+
+    Existing roots, state, credential file and optional model profile survive a
+    new clone's onboarding. The explicit runtime may change. Repository changes
+    and central-bot replacement are refused. Merge and update share one lock.
+    """
+    return install_service(roots, state, repository, **options, ensure=True)
 
 
 def service_status(*, unit_dir=None, runner=None):

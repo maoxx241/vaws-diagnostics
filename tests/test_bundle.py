@@ -1,12 +1,36 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from vaws_diagnostics import configure, collect_bundle, export_public_event
 from vaws_diagnostics.bundle import _canonical
+
+
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='POSIX FIFO race')
+def test_regular_input_replaced_by_fifo_cannot_block_open(tmp_path):
+    script = '''import os,sys
+from pathlib import Path
+from vaws_diagnostics.bundle import _safe_open
+path=Path(sys.argv[1]);path.write_bytes(b'fixture')
+original=os.open
+def swap(value, flags, *args):
+    path.unlink();os.mkfifo(path)
+    return original(value, flags, *args)
+os.open=swap
+try:
+    with _safe_open(path):
+        raise AssertionError('FIFO accepted')
+except ValueError:
+    pass
+'''
+    result = subprocess.run([sys.executable, '-c', script, str(tmp_path / 'raced-input')],
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
 
 
 def example(**changes):

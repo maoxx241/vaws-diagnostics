@@ -324,10 +324,13 @@ def _verify_unit(unit, config):
 
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
                     grok_home=None, grok_work=None, interval=60, since=None,
-                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False):
+                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False,
+                    ensure=False):
     runner = runner or subprocess.run
     manifest, label, unit = _paths(unit_dir)
     roots = list(dict.fromkeys(str(common._absolute(root)) for root in roots))
+    if ensure and central_bot:
+        raise common.ServiceError('central_bot_is_not_a_local_reporter')
     if central_bot and roots:
         raise common.ServiceError("central_bot_does_not_watch_local_logs")
     if not (0 if central_bot else 1) <= len(roots) <= 32:
@@ -341,16 +344,20 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         raise common.ServiceError("invalid_interval")
     if bool(grok) != bool(grok_home and grok_work) or ((grok_home or grok_work) and not grok):
         raise common.ServiceError("grok_profile_required")
-    if save_token:
-        if environment_file is not None:
-            raise common.ServiceError("choose_existing_file_or_save_token")
-        environment_file = save_environment_token(state, runner)
-    env_file = _private_environment(environment_file, runner)
-    gh_path = common._reporter_executable(gh, env_file)
+    if save_token and environment_file is not None:
+        raise common.ServiceError("choose_existing_file_or_save_token")
     with _locked(manifest):
         # Resolve again after creation, accounting for Windows package redirection.
         manifest, label, unit = _paths(manifest.parent)
         existing = _read(manifest)
+        if ensure and existing:
+            from .service_config import merged_reporter_options
+            retained = merged_reporter_options(existing['argv'], existing['environment_file'], roots, repository)
+            roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
+            environment_file = retained['environment_file']
+            save_token = False
+            grok, grok_home, grok_work = (retained[key] for key in ('grok', 'grok_home', 'grok_work'))
+            interval = retained['interval']
         fixed_since = existing["since"] if existing else common._since(since)
         interpreter, version = common._interpreter(runner, python)
         launcher = _physical(interpreter)
@@ -363,6 +370,26 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         else:
             loaded = _launchd_status(runner, label, manifest, existing)
         _verify_unit(unit, existing)
+        # The manager runs outside the calling application's MSIX namespace.
+        # Materialize explicit local directories before resolving their physical
+        # paths, including first use when the diagnostic directory is absent.
+        physical_roots = []
+        for root in roots:
+            directory = Path(root)
+            if any(item.is_symlink() for item in (directory, *directory.parents)):
+                raise common.ServiceError('unsafe_diagnostic_root')
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            physical_roots.append(str(_physical(directory)))
+        roots = list(dict.fromkeys(physical_roots))
+        if any(item.is_symlink() for item in (state, *state.parents)):
+            raise common.ServiceError('unsafe_state_directory')
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state = _physical(state)
+        if save_token:
+            environment_file = save_environment_token(state, runner)
+        env_file = _private_environment(environment_file, runner)
+        gh_path = (str(common._executable(gh)) if ensure and existing and env_file is None
+                   else common._reporter_executable(gh, env_file))
         argv = ["worker"]
         if central_bot:
             argv.append("--central-bot")

@@ -169,6 +169,19 @@ Windows DACL limited to the current user and SYSTEM. No token is saved by
 default. The installer refuses unrelated units, editable packages and system Python.
 `service remove` stops only this unit and preserves logs and queues.
 
+First-use clients should call `service ensure` with the same installation
+arguments. Under the service owner's lock it adds new log roots to an existing
+local reporter and retains its state, credential file, GitHub executable,
+optional Grok profile and observation start time. A requested installed Python
+runtime may replace the previous runtime. Repeated calls do not restart an
+unchanged worker. An existing central bot or different destination repository
+is refused instead of being replaced.
+
+For `ensure`, `--save-token` applies only when creating the service. Existing
+authentication is retained even when another clone has a different token in
+its environment. Use explicit `service install` to rotate authentication or
+replace configuration. Credentials are never read back by the installer.
+
 The service manager must run while observation is wanted. Linux installations
 may enable user lingering through their administrator. On Windows the worker
 can run in WSL; a login Task Scheduler action can start the WSL user service.
@@ -270,7 +283,8 @@ by a separate maintainer service. Stop that central service to stop its work.
 Changing modes does not grant consent to local queue entries. Published comment
 markers are reconciled before any model call, and evidence markers avoid
 duplicate diagnosis across local/central queues. Use fresh state for this
-release; previous database formats and worker installations are not migrated.
+release; previous database formats are not migrated. Current-format owned
+service configurations support ordinary idempotent `service ensure` reuse.
 
 ## Development
 

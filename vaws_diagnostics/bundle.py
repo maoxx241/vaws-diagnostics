@@ -178,7 +178,7 @@ def _safe_open(path):
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("non-file diagnostics input refused")
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     after = os.fstat(fd)
     if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
         os.close(fd)

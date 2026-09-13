@@ -66,7 +66,7 @@ def parser() -> argparse.ArgumentParser:
     profile.add_argument("--home", required=True)
     service = sub.add_parser('service', help='explicitly install, inspect or remove a supervised user worker')
     service_sub = service.add_subparsers(dest='action', required=True)
-    install = service_sub.add_parser('install')
+    install = argparse.ArgumentParser(add_help=False)
     install.add_argument('--root', action='append', default=[])
     install.add_argument('--state', required=True)
     install.add_argument('--repository', default=DEFAULT_REPOSITORY)
@@ -81,6 +81,8 @@ def parser() -> argparse.ArgumentParser:
     install.add_argument('--save-token', action='store_true', help='explicitly save the current GitHub token into a private worker credential file')
     install.add_argument('--no-start', action='store_true')
     install.add_argument('--central-bot', action='store_true', help='maintainer mode: diagnose already-public issues; do not ingest or upload local logs')
+    service_sub.add_parser('install', parents=[install])
+    service_sub.add_parser('ensure', parents=[install], help='add roots to the owned local reporter while retaining state and credentials')
     service_sub.add_parser('status')
     service_sub.add_parser('remove')
     worker = sub.add_parser("worker", help="enable local failure reporting and optional Grok diagnosis")
@@ -101,10 +103,11 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == 'service':
-        from .service import install_service, service_status, remove_service, ServiceError
+        from .service import install_service, ensure_reporter_service, service_status, remove_service, ServiceError
         try:
-            if args.action == 'install':
-                result = install_service(args.root, args.state, args.repository, python=args.python, gh=args.gh,
+            if args.action in {'install', 'ensure'}:
+                action = ensure_reporter_service if args.action == 'ensure' else install_service
+                result = action(args.root, args.state, args.repository, python=args.python, gh=args.gh,
                                          grok=args.grok, grok_home=args.grok_home, grok_work=args.grok_work,
                                          interval=args.interval, since=args.since, environment_file=args.environment_file,
                                          save_token=args.save_token,
