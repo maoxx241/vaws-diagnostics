@@ -166,6 +166,8 @@ def _interpreter(runner, python):
 
 def _environment_file(value):
     path = _absolute(value)
+    if str(path) != str(path).rstrip() or any(char in str(path) for char in '*?['):
+        raise ServiceError('unsupported_environment_path')
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise ServiceError("unsafe_environment_file")
     info = path.stat()
@@ -199,7 +201,10 @@ def _locked(path):
 def _publish(path, text, runner):
     if len(text.encode("utf-8")) > MAX_UNIT_BYTES:
         raise ServiceError("unit_too_large")
-    descriptor, temporary = tempfile.mkstemp(prefix=".vaws-diagnostics-", suffix=".service", dir=path.parent)
+    # An isolated sibling directory keeps systemd-analyze from loading a broken
+    # old unit alongside the candidate. It remains on the same filesystem.
+    staging = Path(tempfile.mkdtemp(prefix='.vaws-unit-', dir=path.parent))
+    descriptor, temporary = tempfile.mkstemp(prefix="vaws-diagnostics-", suffix=".service", dir=staging)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
@@ -210,12 +215,16 @@ def _publish(path, text, runner):
         # minimal systemd installations omit this optional inspection binary.
         analyzer = shutil.which("systemd-analyze")
         if analyzer:
-            _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
+            checked = _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
+            if checked.stderr.strip():
+                # Invalid non-fatal directives may be ignored with exit zero.
+                raise ServiceError('unit_verification_warning', action='unit.verify')
         os.replace(temporary, path)
         return "verified" if analyzer else "unavailable"
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+        staging.rmdir()
 
 
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
@@ -259,7 +268,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
                 "[Unit]\nDescription=VAWS local diagnostics reporter\nAfter=network-online.target\n"
                 "\n[Service]\nType=exec\nExecStart=" + " ".join(map(_quoted, argv)) + "\n"
                 "WorkingDirectory=/\n"
-                + ("EnvironmentFile=" + _quoted(environment_file).replace("$$", "$") + "\n" if environment_file else "") +
+                + ("EnvironmentFile=" + str(environment_file).replace('%', '%%') + "\n" if environment_file else "") +
                 "UnsetEnvironment=PYTHONPATH PYTHONHOME\nRestart=on-failure\nRestartSec=10\n"
                 "TimeoutStopSec=20\nKillMode=control-group\nUMask=0077\n"
                 "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=vaws-diagnostics\n"
