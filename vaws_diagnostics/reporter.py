@@ -156,6 +156,6 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         return {"status": "blocked", "error": "invalid_or_unsafe_diagnostic_payload"}
 
 
-def ingest(root: str | Path, queue: Outbox, *, max_files: int = 256, max_bytes: int = 8 * 1024 * 1024) -> dict[str, int]:
+def ingest(root: str | Path, queue: Outbox, *, max_files: int = 256, max_bytes: int = 8 * 1024 * 1024, since: float | None = None) -> dict[str, int]:
     from .ingestion import ingest as read_events
-    return read_events(root, queue, max_files=max_files, max_bytes=max_bytes)
+    return read_events(root, queue, max_files=max_files, max_bytes=max_bytes, since=since)

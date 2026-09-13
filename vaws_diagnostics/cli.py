@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import signal
 import threading
@@ -32,6 +33,7 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--grok-work")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--interval", type=float, default=60)
+    worker.add_argument("--since", help="optional fixed UTC start timestamp; older logs remain local")
     return result
 
 
@@ -56,6 +58,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.interval < 5:
         parser().error("worker interval must be at least 5 seconds")
+    since = None
+    if args.since:
+        try:
+            parsed = datetime.fromisoformat(args.since.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('timezone required')
+            since = parsed.timestamp()
+        except ValueError:
+            parser().error('--since must be an ISO timestamp with a timezone')
     if args.grok and not (args.grok_home and args.grok_work):
         parser().error("--grok requires --grok-home and --grok-work")
     from . import configure, __version__
@@ -74,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             with recorder.operation("worker.cycle") as op:
                 for root in args.root:
                     with op.phase("ingest"):
-                        result["ingestion"].append(ingest(root, queue))
+                        result["ingestion"].append(ingest(root, queue, since=since))
                     from .maintenance import prune
                     with op.phase("retention"):
                         op.event("INFO", "retention.complete", **prune(root))

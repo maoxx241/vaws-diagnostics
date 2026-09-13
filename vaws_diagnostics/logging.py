@@ -56,12 +56,20 @@ def _package(component):
     if component not in _VERSIONS:
         info = {"package_version": "unknown"}
         try:
-            distribution = metadata.distribution(component)
-            info["package_version"] = distribution.version
-            direct = json.loads(distribution.read_text("direct_url.json") or "{}")
-            revision = direct.get("vcs_info", {}).get("commit_id")
-            if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{7,64}", revision):
-                info["package_revision"] = revision
+            distribution_name = 'vaws-remote-dev' if component == 'remote-dev' else component
+            module_name = 'remote_dev' if distribution_name == 'vaws-remote-dev' else distribution_name.replace('-', '_')
+            distribution = metadata.distribution(distribution_name)
+            module = sys.modules.get(module_name)
+            loaded = getattr(module, '__file__', None)
+            installed = distribution.locate_file(module_name + '/__init__.py')
+            # An installed old wheel can coexist with a PYTHONPATH candidate.
+            # Its direct_url commit is not evidence of the code being executed.
+            if loaded and Path(loaded).resolve() == Path(installed).resolve():
+                info["package_version"] = distribution.version
+                direct = json.loads(distribution.read_text("direct_url.json") or "{}")
+                revision = direct.get("vcs_info", {}).get("commit_id")
+                if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{7,64}", revision):
+                    info["package_revision"] = revision
         except Exception:
             pass
         _VERSIONS[component] = info

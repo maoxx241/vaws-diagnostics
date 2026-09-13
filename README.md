@@ -86,6 +86,9 @@ The default destination is
 it. Repeat `--root` to watch multiple explicit diagnostic roots. `--once` runs one
 cycle for Task Scheduler, systemd timers or other service managers; otherwise the
 worker repeats every 60 seconds. `--interval` changes this (minimum 5 seconds).
+`--since` accepts a fixed ISO timestamp with a timezone when an installation
+should observe future incidents without backfilling historical logs. Keep the
+same timestamp across restarts; it does not delete older local evidence.
 Run it as the user whose tools produce these logs, with that user's GitHub login.
 Do not put tokens in command arguments, repository files or diagnostic bundles.
 

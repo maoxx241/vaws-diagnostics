@@ -242,3 +242,20 @@ def test_fork_resets_locks_held_by_another_thread(tmp_path):
         thread.join(3)
         old.close()
         current.close()
+def test_import_override_does_not_claim_installed_revision(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from vaws_diagnostics import logging as implementation
+    class Distribution:
+        version = '1.0.0'
+        def locate_file(self, path):
+            return tmp_path / 'installed' / path
+        def read_text(self, name):
+            return '{"vcs_info":{"commit_id":"' + 'a' * 40 + '"}}'
+    monkeypatch.setattr(implementation.metadata, 'distribution', lambda _: Distribution())
+    monkeypatch.setitem(sys.modules, 'vaws_test', SimpleNamespace(__file__=str(tmp_path / 'candidate' / 'vaws_test' / '__init__.py')))
+    monkeypatch.setattr(implementation, '_VERSIONS', {})
+    assert implementation._package('vaws-test') == {'package_version': 'unknown'}
+    monkeypatch.setitem(sys.modules, 'vaws_test', SimpleNamespace(__file__=str(tmp_path / 'installed' / 'vaws_test' / '__init__.py')))
+    monkeypatch.setattr(implementation, '_VERSIONS', {})
+    assert implementation._package('vaws-test')['package_revision'] == 'a' * 40

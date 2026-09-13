@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -43,12 +44,12 @@ def _candidates(root, counts):
     return files
 
 
-def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024):
+def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, since=None):
     from .reporter import fingerprint, issue_payload
     root = Path(root).absolute()
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise ValueError('diagnostic root must not traverse symlinks')
-    counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0}
+    counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0, 'before_start': 0}
     with queue.connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, inode TEXT, offset INTEGER, touched REAL, discard INTEGER DEFAULT 0)')
         if 'discard' not in {row[1] for row in db.execute('PRAGMA table_info(cursors)')}:
@@ -100,6 +101,9 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024):
                     event = export_public_event(raw)
                     if event is None:
                         counts['invalid'] += 1
+                        continue
+                    if since is not None and datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp() < since:
+                        counts['before_start'] += 1
                         continue
                     recent.append(event)
                     if event.get('event') != 'operation.end' or event.get('status') != 'error':
