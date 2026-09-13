@@ -112,7 +112,9 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                     recent.append(event)
                     if event.get('event') != 'operation.end' or event.get('status') != 'error':
                         continue
-                    if event.get('attributes', {}).get('category') in {'caller', 'cancelled'}:
+                    attributes = event.get('attributes', {})
+                    if (attributes.get('category') in {'caller', 'cancelled'}
+                            or attributes.get('classification') in {'caller', 'cancelled'}):
                         counts['caller_errors'] += 1
                         continue
                     records = [row for row in recent if row['operation_id'] == event['operation_id']]

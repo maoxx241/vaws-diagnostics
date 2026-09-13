@@ -128,7 +128,12 @@ vaws-diagnostics status --state /path/to/reporter-state
 ```
 
 The outbox keeps immutable sanitized evidence, occurrence counts, publication
-state and last error. It deduplicates by component, version, operation, failing
+state and last error. Explicit owner `classification=caller` or `cancelled`
+remains in the bounded export and is not submitted as an automatic issue.
+Only `caller`, `cancelled` and `unknown` are accepted classifications; generic
+validation/permission categories and nonzero exit codes do not imply caller error.
+The legacy explicit `caller`/`cancelled` categories remain supported.
+It deduplicates by component, version, operation, failing
 phase and error fingerprint. Byte cursors survive worker restarts; deduplication
 also handles rereading rotated segments. The queue is capped at 1,000 unpublished incidents,
 with a maximum of 10 issue submissions per hour. Full queues retain existing
