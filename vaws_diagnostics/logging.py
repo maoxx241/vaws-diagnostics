@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 
 from .context import bind_context, current_context
 from .redact import redact_text
@@ -29,6 +30,26 @@ _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRI
 _RECORDERS = {}
 _VERSIONS = {}
 _LOCK = threading.RLock()
+_LIVE_RECORDERS = weakref.WeakSet()
+
+
+def _after_fork():
+    # Python resets stdlib logging locks, but it cannot reset our own locks.
+    # Include recorders replaced by configure while an older operation lives.
+    global _LOCK
+    _LOCK = threading.RLock()
+    for recorder in list(_LIVE_RECORDERS):
+        recorder._mutex = threading.RLock()
+        recorder._logger = None
+        recorder._path = None
+        recorder._pid = None
+        recorder._retry_at = 0.0
+        recorder._process_id = uuid.uuid4().hex
+        recorder._birth_pid = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork)
 
 
 def _package(component):
@@ -153,6 +174,8 @@ class Recorder:
         self.logging_failed = False
         self._notified = False
         self._retry_at = 0.0
+        with _LOCK:
+            _LIVE_RECORDERS.add(self)
 
     def _unavailable(self):
         self.logging_failed = True

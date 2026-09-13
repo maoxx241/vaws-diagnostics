@@ -58,8 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         parser().error("worker interval must be at least 5 seconds")
     if args.grok and not (args.grok_home and args.grok_work):
         parser().error("--grok requires --grok-home and --grok-work")
-    from . import configure
-    recorder = configure("diagnostic-worker", root=state / "diagnostics")
+    from . import configure, __version__
+    recorder = configure("vaws-diagnostics", root=state / "diagnostics", version=__version__)
     queue, github = Outbox(state / "reporter.sqlite3"), GitHub(args.repository, executable=args.gh)
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -80,11 +80,15 @@ def main(argv: list[str] | None = None) -> int:
                         op.event("INFO", "retention.complete", **prune(root))
                 with op.phase("report"):
                     result["reporter"] = publish_one(queue, github)
+                    op.event('WARNING' if result['reporter']['status'] in {'retry', 'uncertain', 'blocked', 'rate_limited'} else 'INFO',
+                             'reporter.result', status=result['reporter']['status'], error_code=result['reporter'].get('error'))
                 if grok and bot_queue:
                     from .bot import diagnose_one, enqueue_issues
                     with op.phase("diagnose"):
                         enqueue_issues(github, bot_queue)
                         result["bot"] = diagnose_one(bot_queue, github, grok)
+                        op.event('WARNING' if result['bot']['status'] in {'retry', 'uncertain', 'blocked', 'rate_limited'} else 'INFO',
+                                 'bot.result', status=result['bot']['status'], error_code=result['bot'].get('error'))
             print(json.dumps(result, ensure_ascii=True), flush=True)
         except Exception as exc:
             # Operation context already records the local exception. Do not copy

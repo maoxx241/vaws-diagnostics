@@ -42,4 +42,3 @@ def test_rules_unique_and_allowlist_core_compatible(tmp_path):
     assert scan_tree({"location": [literal]})[0].path == "location[0]"
     with pytest.raises(ValueError):
         Allowlist(patterns=["("])
-

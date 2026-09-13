@@ -33,6 +33,7 @@ class Outbox:
                 CREATE TABLE IF NOT EXISTS seen (
                     operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS publications (at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS generations (at REAL NOT NULL);
             """)
 
     @contextmanager
@@ -55,6 +56,7 @@ class Outbox:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM seen WHERE observed < ?", (now - 30 * 86400,))
             db.execute("DELETE FROM publications WHERE at < ?", (now - 86400,))
+            db.execute("DELETE FROM generations WHERE at < ?", (now - 86400,))
             db.execute("DELETE FROM incidents WHERE state='published' AND last_seen < ?", (now - 30 * 86400,))
             if db.execute("SELECT 1 FROM seen WHERE operation_id=?", (operation_id,)).fetchone():
                 return False
@@ -102,6 +104,20 @@ class Outbox:
             if cursor.rowcount != 1:
                 raise RuntimeError("diagnostic worker lease expired before publication")
             db.execute("INSERT INTO publications VALUES (?)", (now,))
+        return True
+
+    def begin_generation(self, item: dict[str, Any], *, hourly_limit: int = 10) -> bool:
+        """Bound paid model requests independently of comment publication."""
+        now = self.clock()
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if not db.execute('SELECT 1 FROM incidents WHERE fingerprint=? AND lease_token=? AND lease_until>?',
+                              (item['fingerprint'], item['lease_token'], now)).fetchone():
+                raise RuntimeError('bot lease expired before generation')
+            db.execute('DELETE FROM generations WHERE at < ?', (now - 86400,))
+            if db.execute('SELECT COUNT(*) FROM generations WHERE at >= ?', (now - 3600,)).fetchone()[0] >= hourly_limit:
+                return False
+            db.execute('INSERT INTO generations VALUES (?)', (now,))
         return True
 
     def rows(self) -> list[dict[str, Any]]:

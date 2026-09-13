@@ -39,6 +39,8 @@ def test_rate_limit_and_unwritable_database(tmp_path):
     queue.enqueue('a', 'o', {})
     item = queue.claim()
     assert not queue.begin_post(item, hourly_limit=0)
+    assert queue.begin_generation(item, hourly_limit=1)
+    assert not queue.begin_generation(item, hourly_limit=1)
     file = tmp_path / 'file'
     file.write_text('not a directory')
     with pytest.raises(OSError):

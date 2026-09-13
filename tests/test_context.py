@@ -44,4 +44,3 @@ def test_environment_round_trip_and_bad_input(monkeypatch):
     for raw in ("[]", "{broken", '{"trace_id": "not-id"}', "x" * 2049):
         monkeypatch.setenv("VAWS_DIAGNOSTICS_CONTEXT", raw)
         assert current_context() == {}
-

@@ -94,6 +94,9 @@ class Grok:
             except subprocess.TimeoutExpired as exc:
                 raise TransportError("grok_timeout", retry_after=300) from exc
         if result.returncode or len(result.stdout.encode()) > 256000:
+            from . import get_recorder
+            get_recorder('vaws-diagnostics').event('ERROR', 'grok.request.failed',
+                                                 exit_code=result.returncode, error_detail=result.stderr[:4000])
             raise TransportError("grok_failed_or_oversized_reply", retry_after=300)
         try:
             response = json.loads(result.stdout)
@@ -169,6 +172,9 @@ def diagnose_one(queue: Outbox, github: GitHub, grok: Grok) -> dict[str, Any]:
             return {"status": "uncertain"}
         diagnosis = item.get("diagnosis")
         if not diagnosis:
+            if not queue.begin_generation(item):
+                queue.update(item, state='retry', next_attempt=queue.clock() + 3600, last_error='grok_hourly_generation_limit')
+                return {'status': 'rate_limited'}
             diagnosis = grok.diagnose(item["payload"]["evidence"])
             with queue.connect() as db:
                 cursor = db.execute("UPDATE incidents SET diagnosis=? WHERE fingerprint=? AND lease_token=? AND lease_until>?", (diagnosis, item["fingerprint"], item["lease_token"], queue.clock()))

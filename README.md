@@ -72,6 +72,9 @@ Private free-form output stays excluded, even if a regex scanner finds no secret
 Enabling the independent worker is the installation's explicit choice to publish
 sanitized failures to the selected repository. Merely importing or installing the
 library does not upload anything. No per-tool approval or Agent report is needed.
+Explicit caller input errors and user cancellation remain in local diagnostics;
+they do not automatically create VAWS bug reports. Unknown failures are retained
+for diagnosis rather than guessed to be caller mistakes.
 
 ```sh
 gh auth login
@@ -130,7 +133,7 @@ The bot reads only the structured diagnostic evidence in marked VAWS issues.
 Issue prose, links and comments do not become execution instructions. Grok has
 no enabled business tools and returns observations, hypotheses, missing evidence
 and suggested checks. Its response is bounded and leak-scanned before posting.
-A separate queue caches model results and reconciles comment markers after lost
+A separate queue caps model requests at ten per hour, caches results and reconciles comment markers after lost
 responses, avoiding duplicate comments and unnecessary model reruns. The bot does
 not change services, close issues or merge fixes. A model hypothesis is not a
 confirmed root cause. GitHub/model availability never delays the original tool.

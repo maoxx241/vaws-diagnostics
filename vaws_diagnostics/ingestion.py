@@ -48,7 +48,7 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024):
     root = Path(root).absolute()
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise ValueError('diagnostic root must not traverse symlinks')
-    counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0}
+    counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0}
     with queue.connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, inode TEXT, offset INTEGER, touched REAL, discard INTEGER DEFAULT 0)')
         if 'discard' not in {row[1] for row in db.execute('PRAGMA table_info(cursors)')}:
@@ -103,6 +103,9 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024):
                         continue
                     recent.append(event)
                     if event.get('event') != 'operation.end' or event.get('status') != 'error':
+                        continue
+                    if event.get('attributes', {}).get('category') == 'caller':
+                        counts['caller_errors'] += 1
                         continue
                     records = [row for row in recent if row['operation_id'] == event['operation_id']]
                     bundle = collect_bundle(root, operation_id=event['operation_id'], records=records,

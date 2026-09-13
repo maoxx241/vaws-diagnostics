@@ -193,3 +193,52 @@ def test_posix_private_leaf_and_rotated_files(tmp_path, monkeypatch):
     files = list(leaf.iterdir())
     assert len(files) > 1
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files)
+
+def test_fork_resets_locks_held_by_another_thread(tmp_path):
+    import os
+    import signal
+    import threading
+    import time
+    import pytest
+    import vaws_diagnostics.logging as log
+    if not hasattr(os, "fork"):
+        pytest.skip("requires fork")
+    old = log.configure("fork-locks", root=tmp_path / "old")
+    old.event("INFO", "parent.sample")
+    current = log.configure("fork-locks", root=tmp_path / "new")
+    ready, release = threading.Event(), threading.Event()
+    def hold():
+        with log._LOCK, old._mutex, current._mutex:
+            ready.set()
+            release.wait(10)
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert ready.wait(2)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            old.event("INFO", "child.old")
+            current.event("INFO", "child.current")
+            log.get_recorder("fork-new").event("DEBUG", "child.registry")
+            os._exit(0 if old.record_ref and current.record_ref else 2)
+        except BaseException:
+            os._exit(3)
+    status = None
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            completed, child_status = os.waitpid(pid, os.WNOHANG)
+            if completed:
+                status = child_status
+                break
+            time.sleep(0.01)
+        if status is None:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        assert status is not None, "child logging waited for an inherited non-owning thread lock"
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        release.set()
+        thread.join(3)
+        old.close()
+        current.close()
