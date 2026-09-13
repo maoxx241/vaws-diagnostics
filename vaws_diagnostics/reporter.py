@@ -3,16 +3,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .outbox import Outbox
+from .community import ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 
 DEFAULT_REPOSITORY = "vllm-ascend-workspace/vllm-ascend-workspace"
 MARKER = "<!-- vaws-incident:"
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        # A token is scoped to api.github.com. Never forward it to a redirect.
+        return None
 
 
 class TransportError(RuntimeError):
@@ -74,13 +85,17 @@ def render_issue(item: dict[str, Any]) -> tuple[str, str]:
 
 
 class GitHub:
-    """Uses existing gh authentication; no token appears in args or diagnostics."""
+    """Existing gh authentication or an environment token without gh installed."""
     def __init__(self, repository: str = DEFAULT_REPOSITORY, *, executable: str = "gh", timeout: float = 30):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError("invalid GitHub repository")
         self.repository, self.executable, self.timeout = repository, executable, timeout
 
     def request(self, method: str, path: str, payload: dict | None = None):
+        check_remote_action()
+        token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+        if token and shutil.which(self.executable) is None:
+            return self._token_request(method, path, payload, token)
         command = [self.executable, "api", "--hostname", "github.com", "--method", method,
                    "-H", "Accept: application/vnd.github+json", path]
         data = None
@@ -107,6 +122,30 @@ class GitHub:
         except (ValueError, TypeError) as exc:
             raise TransportError("github_invalid_reply", uncertain=method != "GET") from exc
 
+    def _token_request(self, method, path, payload, token):
+        """Fixed-host HTTPS; credentials never enter command lines or errors."""
+        if not isinstance(path, str) or not path.startswith('repos/') or any(char in path for char in '\r\n#'):
+            raise TransportError('github_invalid_path')
+        data = json.dumps(payload, ensure_ascii=True).encode() if payload is not None else None
+        request = Request('https://api.github.com/' + path, data=data, method=method,
+                          headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + token,
+                                   'Content-Type': 'application/json', 'User-Agent': 'vaws-diagnostics'})
+        try:
+            check_remote_action()
+            with build_opener(_NoRedirect()).open(request, timeout=self.timeout) as response:
+                raw = response.read(8 * 1024 * 1024 + 1)
+            if len(raw) > 8 * 1024 * 1024:
+                raise TransportError('github_oversized_reply', uncertain=method != 'GET')
+            return json.loads(raw)
+        except HTTPError as exc:
+            code = exc.code
+            raise TransportError(f'github_http_{code}', uncertain=method != 'GET' and not 400 <= code < 500,
+                                 retry_after=3600 if code in (403, 429) else 60) from None
+        except (URLError, TimeoutError, OSError) as exc:
+            raise TransportError('github_transport_error', uncertain=method != 'GET') from None
+        except (ValueError, TypeError):
+            raise TransportError('github_invalid_reply', uncertain=method != 'GET') from None
+
     def find_issue(self, item: dict[str, Any]):
         # Direct paginated REST listing avoids search-index eventual consistency.
         marker = f"{MARKER}{item['fingerprint']} -->"
@@ -131,7 +170,9 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
     if not item:
         return {"status": "idle"}
     try:
-        existing = github.find_issue(item)
+        with guard_consent(item.get('consent')):
+            existing = github.find_issue(item)
+        require_consent(item.get('consent'))
         if existing:
             queue.update(item, state="published", issue_number=existing["number"], issue_url=existing["html_url"], last_error=None)
             return {"status": "reconciled", "issue_url": existing["html_url"]}
@@ -142,11 +183,16 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         if not queue.begin_post(item):
             queue.update(item, state="retry", next_attempt=queue.clock() + 3600, last_error="local_hourly_rate_limit")
             return {"status": "rate_limited"}
-        reply = github.create_issue(title, body)
+        with guard_consent(item.get('consent')):
+            reply = github.create_issue(title, body)
         if not isinstance(reply, dict) or not isinstance(reply.get("number"), int) or not isinstance(reply.get("html_url"), str):
             raise TransportError("github_invalid_create_reply", uncertain=True)
         queue.update(item, state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
         return {"status": "published", "issue_url": reply["html_url"]}
+    except ConsentWithdrawn:
+        queue.update(item, state='withdrawn', diagnosis_state='withdrawn',
+                     last_error='community_consent_unavailable_or_withdrawn')
+        return {'status': 'withdrawn'}
     except TransportError as exc:
         uncertain = exc.uncertain or item["state"] == "uncertain"
         delay = max(exc.retry_after, min(3600, 30 * 2 ** min(item["attempts"], 7)))

@@ -7,6 +7,8 @@ from vaws_diagnostics import configure, collect_bundle
 from vaws_diagnostics.outbox import Outbox
 from vaws_diagnostics.reporter import ingest, issue_payload, render_issue
 
+pytestmark = pytest.mark.usefixtures('community_consent')
+
 
 def failure(root):
     rec = configure('vaws-diagnostics', root=root, level='DEBUG')

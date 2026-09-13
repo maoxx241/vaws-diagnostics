@@ -5,6 +5,9 @@ import pytest
 
 from vaws_diagnostics.outbox import Outbox
 from vaws_diagnostics.reporter import GitHub, TransportError, publish_one
+from vaws_diagnostics.community import current_consent
+
+pytestmark = pytest.mark.usefixtures('community_consent')
 
 
 class FakeGitHub:
@@ -26,7 +29,7 @@ class FakeGitHub:
 def test_accepted_post_lost_reply_reconciles_without_duplicate(tmp_path, monkeypatch):
     now = [1000.0]
     queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
-    queue.enqueue('a', 'o', {})
+    queue.enqueue('a', 'o', {}, consent=current_consent())
     monkeypatch.setattr('vaws_diagnostics.reporter.render_issue', lambda _: ('title', 'body'))
     github = FakeGitHub(lost=True)
     assert publish_one(queue, github)['status'] == 'uncertain'
@@ -37,7 +40,7 @@ def test_accepted_post_lost_reply_reconciles_without_duplicate(tmp_path, monkeyp
 
 def test_uncertain_missing_issue_never_replays(tmp_path, monkeypatch):
     queue = Outbox(tmp_path / 'queue.db')
-    queue.enqueue('a', 'o', {})
+    queue.enqueue('a', 'o', {}, consent=current_consent())
     item = queue.claim()
     queue.update(item, state='uncertain')
     github = FakeGitHub()
@@ -47,7 +50,7 @@ def test_uncertain_missing_issue_never_replays(tmp_path, monkeypatch):
 
 def test_sanitizer_failure_blocks_post(tmp_path, monkeypatch):
     queue = Outbox(tmp_path / 'queue.db')
-    queue.enqueue('a', 'o', {})
+    queue.enqueue('a', 'o', {}, consent=current_consent())
     monkeypatch.setattr('vaws_diagnostics.reporter.render_issue', lambda _: (_ for _ in ()).throw(ValueError('unsafe')))
     github = FakeGitHub()
     assert publish_one(queue, github)['status'] == 'blocked'

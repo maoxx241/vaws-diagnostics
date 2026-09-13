@@ -1,4 +1,4 @@
-"""Install one explicitly enabled Linux user service; never edit personal units.
+"""Install an explicitly enabled native user service; never edit personal units.
 
 This is installation work, not a task entry or background execution authority.
 The unit rate-limits its journal output; system-wide journal capacity remains
@@ -177,6 +177,19 @@ def _environment_file(value):
     return path
 
 
+def _reporter_executable(value, environment_file):
+    if environment_file is None and any(os.environ.get(key) for key in ("GH_TOKEN", "GITHUB_TOKEN")):
+        raise ServiceError("persistent_credentials_required")
+    try:
+        return str(_executable(value or "gh"))
+    except ServiceError:
+        if environment_file is not None:
+            # The worker's HTTPS adapter can use a private token when no CLI is
+            # installed. The service manager stores the file path, never its value.
+            return str(value or "gh")
+        raise ServiceError("github_authentication_required") from None
+
+
 @contextmanager
 def _locked(path):
     import fcntl
@@ -229,18 +242,28 @@ def _publish(path, text, runner):
 
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
                     grok_home=None, grok_work=None, interval=60, since=None,
-                    environment_file=None, unit_dir=None, runner=None, start=True):
+                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False):
     """Install/update the owned unit, preserving the first installation's since.
 
     ``start=False`` writes/enables it without starting or restarting a process.
     State and source logs are never removed, including during uninstall.
     """
+    if sys.platform in {"win32", "darwin"}:
+        from .platform_service import install_service as install_native
+        return install_native(roots, state, repository, python=python, gh=gh, grok=grok,
+                              grok_home=grok_home, grok_work=grok_work, interval=interval, since=since,
+                              environment_file=environment_file, unit_dir=unit_dir, runner=runner, start=start,
+                              save_token=save_token, central_bot=central_bot)
     _linux()
     runner = runner or subprocess.run
     path = _unit_path(unit_dir)
     roots = [_absolute(root) for root in roots]
-    if not 1 <= len(roots) <= 32:
+    if central_bot and roots:
+        raise ServiceError("central_bot_does_not_watch_local_logs")
+    if not (0 if central_bot else 1) <= len(roots) <= 32:
         raise ServiceError("diagnostic_roots_required")
+    if central_bot and not grok:
+        raise ServiceError("central_bot_requires_grok")
     state = _absolute(state)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ServiceError("invalid_repository")
@@ -248,6 +271,11 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         raise ServiceError("invalid_interval")
     if bool(grok) != bool(grok_home and grok_work) or ((grok_home or grok_work) and not grok):
         raise ServiceError("grok_profile_required")
+    if save_token:
+        if environment_file is not None:
+            raise ServiceError("choose_existing_file_or_save_token")
+        from .platform_service import save_environment_token
+        environment_file = save_environment_token(state, runner)
     environment_file = _environment_file(environment_file) if environment_file is not None else None
     with _locked(path):
         existing = _read_owned(path)
@@ -256,9 +284,11 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
                             repair=existing is not None)
         argv = [str(interpreter), "-I", "-m", "vaws_diagnostics.cli", "worker"]
+        if central_bot:
+            argv.append("--central-bot")
         for root in dict.fromkeys(roots):
             argv += ["--root", str(root)]
-        argv += ["--state", str(state), "--repository", repository, "--gh", str(_executable(gh or "gh")),
+        argv += ["--state", str(state), "--repository", repository, "--gh", _reporter_executable(gh, environment_file),
                  "--since", fixed_since, "--interval", str(interval)]
         if grok:
             argv += ["--grok", str(_executable(grok)), "--grok-home", str(_absolute(grok_home)),
@@ -281,13 +311,16 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         _systemctl(runner, "enable", str(path))
         _check_loaded_owner(runner, path)
         if start:
-            _systemctl(runner, "restart" if existing and changed else "start", UNIT)
+            _systemctl(runner, "restart" if existing and (changed or save_token) else "start", UNIT)
         return {"status": "installed", "unit": str(path), "since": fixed_since,
                 "changed": changed, "start_requested": start, "python": str(interpreter),
                 "package_version": version, "state": str(state), "unit_verification": verification}
 
 
 def service_status(*, unit_dir=None, runner=None):
+    if sys.platform in {"win32", "darwin"}:
+        from .platform_service import service_status as status_native
+        return status_native(unit_dir=unit_dir, runner=runner)
     _linux()
     path = _unit_path(unit_dir)
     existing = _read_owned(path)
@@ -302,6 +335,9 @@ def service_status(*, unit_dir=None, runner=None):
 
 def start_service(*, unit_dir=None, runner=None):
     """Start an existing owned unit without recreating configuration or since."""
+    if sys.platform in {"win32", "darwin"}:
+        from .platform_service import start_service as start_native
+        return start_native(unit_dir=unit_dir, runner=runner)
     _linux()
     path = _unit_path(unit_dir)
     runner = runner or subprocess.run
@@ -316,6 +352,9 @@ def start_service(*, unit_dir=None, runner=None):
 
 
 def remove_service(*, unit_dir=None, runner=None):
+    if sys.platform in {"win32", "darwin"}:
+        from .platform_service import remove_service as remove_native
+        return remove_native(unit_dir=unit_dir, runner=runner)
     _linux()
     path = _unit_path(unit_dir)
     runner = runner or subprocess.run

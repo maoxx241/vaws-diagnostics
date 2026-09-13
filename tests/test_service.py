@@ -53,6 +53,8 @@ def install(tmp_path, monkeypatch):
     # Unit construction is tested on every platform without touching its real
     # service manager. Actual Linux locking gets its own test below.
     monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(service, "_locked", lambda path: (path.parent.mkdir(parents=True, exist_ok=True), nullcontext())[1])
     prefix = tmp_path / 'immutable env % $HOME;not-a-shell'
     python = prefix / "bin/python"
@@ -214,7 +216,7 @@ def test_invalid_configuration_does_not_call_systemctl(install, change):
 
 
 def test_unsupported_platform_is_explicit(monkeypatch):
-    monkeypatch.setattr(service.sys, 'platform', 'win32')
+    monkeypatch.setattr(service.sys, 'platform', 'freebsd')
     for action in (lambda: service.install_service([], '/state', 'example/repository'),
                    service.service_status, service.remove_service):
         with pytest.raises(service.ServiceError, match='unsupported_platform'):

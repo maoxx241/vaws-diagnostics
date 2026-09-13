@@ -16,7 +16,7 @@ def test_published_queue_history_does_not_permanently_block_new_intake(tmp_path)
 
 
 @pytest.mark.parametrize("discard", [False, True])
-def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_path, monkeypatch, discard):
+def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_path, monkeypatch, discard, community_consent):
     from vaws_diagnostics import ingestion
 
     def event(identity):
@@ -25,7 +25,7 @@ def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_pat
             "pid": 1, "component": "vaws-diagnostics", "severity": "ERROR",
             "event": "operation.end", "operation": "operation." + identity,
             "operation_id": identity * 32, "trace_id": "c" * 32,
-            "status": "error", "attributes": {"category": "transport"},
+            "status": "error", "attributes": {"category": "transport"}, "community": community_consent,
         }) + "\n").encode()
 
     folder = tmp_path / "events" / "vaws-diagnostics"
@@ -74,7 +74,7 @@ def test_published_history_is_bounded_without_evicting_pending_evidence(tmp_path
     assert {row["fingerprint"] for row in rows[2:]} == {"6", "7"}
 
 
-def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(tmp_path, monkeypatch):
+def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(tmp_path, monkeypatch, community_consent):
     from vaws_diagnostics.reporter import publish_one
 
     now = [1000.0]
@@ -88,7 +88,7 @@ def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(t
         assert db.execute("SELECT COUNT(*) FROM seen").fetchone()[0] == 20
         assert db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 1
     assert not queue.enqueue("24", "24", {})
-    assert queue.enqueue("0", "0", {})  # Outside the bounded local lookback.
+    assert queue.enqueue("0", "0", {}, consent=community_consent)  # Outside the bounded local lookback.
 
     class ExistingIssue:
         def find_issue(self, item):
