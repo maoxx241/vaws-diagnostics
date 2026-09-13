@@ -126,6 +126,10 @@ def _project(record):
             safe[key] = value
         elif key in _BOOLEAN and isinstance(value, bool):
             safe[key] = value
+        elif key == "error_code" and type(value) is int and -(2**31) <= value < 2**31:
+            safe[key] = value
+        elif key == "classification" and isinstance(value, str) and value in {"caller", "cancelled", "unknown"}:
+            safe[key] = value
         elif key in _LABELS and _label(value) is not None:
             safe[key] = _label(value)
         elif key in _HASHES and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32,64}", value):
