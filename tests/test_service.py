@@ -22,6 +22,7 @@ class Runner:
         self.fragment = ""
         self.dropins = ""
         self.verify_failure = False
+        self.verify_warning = False
 
     def __call__(self, argv, **options):
         self.calls.append((argv, options))
@@ -29,7 +30,8 @@ class Runner:
         if Path(argv[0]).name == "systemd-analyze":
             assert argv[1:3] == ["verify", "--man=no"]
             assert Path(argv[3]).suffix == '.service' and Path(argv[3]).is_file()
-            return subprocess.CompletedProcess(argv, int(self.verify_failure), '', '')
+            return subprocess.CompletedProcess(argv, int(self.verify_failure), '',
+                                               'EnvironmentFile ignored' if self.verify_warning else '')
         if argv[0] != "systemctl":
             assert argv[1:3] == ["-I", "-c"]
             facts = {"prefix": str(self.prefix), "base": "/base-python", "version": "0.1.0",
@@ -102,6 +104,29 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
     previous = path.read_bytes()
     started = service.start_service(unit_dir=values['unit_dir'], runner=runner)
     assert started['since'] == first['since'] and path.read_bytes() == previous
+
+
+def test_reinstall_repairs_own_invalid_unit_but_never_foreign_overrides(install):
+    values, runner = install
+    first = service.install_service(**values)
+    path = Path(first['unit'])
+    path.write_text(path.read_text().replace('WorkingDirectory=/', 'WorkingDirectory="/invalid"'))
+    class InvalidBeforeReload:
+        def __init__(self):
+            self.reloaded = False
+        def __call__(self, argv, **options):
+            if argv[:3] == ['systemctl', '--user', 'daemon-reload']:
+                self.reloaded = True
+            reply = runner(argv, **options)
+            if argv[:3] == ['systemctl', '--user', 'show'] and not self.reloaded:
+                reply.stdout = reply.stdout.replace('LoadState=loaded', 'LoadState=bad-setting')
+            return reply
+    result = service.install_service(**{**values, 'runner': InvalidBeforeReload()})
+    assert result['changed'] and result['since'] == first['since']
+    assert '\nWorkingDirectory=/\n' in path.read_text()
+    runner.dropins = '/personal/override.conf'
+    with pytest.raises(service.ServiceError, match='unowned_unit_override'):
+        service.install_service(**{**values, 'runner': InvalidBeforeReload()})
 
 
 def test_personal_unit_is_never_overwritten_or_stopped(install):
@@ -224,6 +249,7 @@ def test_environment_file_requires_private_regular_owned_file_without_reading_co
     installed = service.install_service(**values, environment_file=secret)
     unit = Path(installed['unit']).read_text()
     assert 'EnvironmentFile=' in unit and 'fixture-never-copy' not in unit
+    assert 'EnvironmentFile=' + str(secret).replace('%', '%%') + '\n' in unit
     link = tmp_path / 'linked.env'
     link.symlink_to(secret)
     with pytest.raises(service.ServiceError, match='unsafe_environment_file'):
@@ -264,6 +290,17 @@ def test_missing_optional_unit_analyzer_is_reported_without_installing_it(instal
     assert Path(result['unit']).is_file()
 
 
+def test_zero_exit_parser_warning_does_not_publish_a_partially_ignored_unit(install, monkeypatch):
+    values, runner = install
+    monkeypatch.setattr(service.shutil, 'which', lambda name: 'systemd-analyze')
+    runner.verify_warning = True
+    with pytest.raises(service.ServiceError, match='unit_verification_warning'):
+        service.install_service(**values)
+    assert not (values['unit_dir'] / service.UNIT).exists()
+    assert not list(values['unit_dir'].glob('.vaws-unit-*'))
+    assert not any(call[0][:3] == ['systemctl', '--user', 'daemon-reload'] for call in runner.calls)
+
+
 @pytest.mark.skipif(sys.platform != 'linux', reason='actual Linux systemd unit parser')
 def test_generated_unit_is_accepted_by_actual_systemd_analyze_and_old_workdir_rejected(install, tmp_path):
     analyzer = shutil.which('systemd-analyze')
@@ -274,6 +311,10 @@ def test_generated_unit_is_accepted_by_actual_systemd_analyze_and_old_workdir_re
     # actual service manager stubbed; only the static unit parser is real.
     values['python'] = Path(sys.executable)
     values['gh'] = Path(sys.executable)
+    environment = tmp_path / 'github % $HOME.env'
+    environment.write_text('FIXTURE=value\n')
+    environment.chmod(0o600)
+    values['environment_file'] = environment
     replies = []
     def runner(argv, **options):
         if Path(argv[0]).name == 'systemd-analyze':
@@ -292,3 +333,9 @@ def test_generated_unit_is_accepted_by_actual_systemd_analyze_and_old_workdir_re
                          capture_output=True, text=True, timeout=30, check=False)
     assert old.returncode != 0
     assert 'WorkingDirectory' in old.stderr and 'not absolute' in old.stderr
+    invalid_environment = tmp_path / 'old-env.service'
+    directive = 'EnvironmentFile=' + str(environment).replace('%', '%%')
+    invalid_environment.write_text(text.replace(directive, 'EnvironmentFile="' + directive.split('=',1)[1] + '"'))
+    ignored = subprocess.run([analyzer, 'verify', '--man=no', str(invalid_environment)],
+                             capture_output=True, text=True, timeout=30, check=False)
+    assert ignored.returncode == 0 and 'EnvironmentFile' in ignored.stderr and 'not absolute' in ignored.stderr

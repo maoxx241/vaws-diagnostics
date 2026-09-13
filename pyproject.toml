@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vaws-diagnostics"
-version = "0.1.1"
+version = "0.1.2"
 description = "Bounded structured diagnostics and safe support bundles for VAWS owners"
 readme = "README.md"
 requires-python = ">=3.11"

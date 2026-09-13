@@ -115,7 +115,7 @@ def _loaded_properties(runner):
     return reply, facts
 
 
-def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False):
+def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False, repair=False):
     reply, facts = _loaded_properties(runner)
     if facts.get("DropInPaths"):
         raise ServiceError("unowned_unit_override")
@@ -124,6 +124,9 @@ def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False):
         raise ServiceError("unowned_loaded_unit")
     if creating and facts.get("LoadState") == "loaded":
         raise ServiceError("unowned_loaded_unit")
+    if (repair and not creating and reply.returncode == 0 and fragment
+            and facts.get('LoadState') == 'bad-setting' and _read_owned(path) is not None):
+        return  # Our exact marked fragment can be repaired; no foreign drop-ins.
     if allow_missing and facts.get("LoadState") == "not-found" and reply.returncode in (0, 1, 4):
         return
     if reply.returncode or facts.get("LoadState") not in {"loaded", "not-found"}:
@@ -163,6 +166,8 @@ def _interpreter(runner, python):
 
 def _environment_file(value):
     path = _absolute(value)
+    if str(path) != str(path).rstrip() or any(char in str(path) for char in '*?['):
+        raise ServiceError('unsupported_environment_path')
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise ServiceError("unsafe_environment_file")
     info = path.stat()
@@ -196,7 +201,10 @@ def _locked(path):
 def _publish(path, text, runner):
     if len(text.encode("utf-8")) > MAX_UNIT_BYTES:
         raise ServiceError("unit_too_large")
-    descriptor, temporary = tempfile.mkstemp(prefix=".vaws-diagnostics-", suffix=".service", dir=path.parent)
+    # An isolated sibling directory keeps systemd-analyze from loading a broken
+    # old unit alongside the candidate. It remains on the same filesystem.
+    staging = Path(tempfile.mkdtemp(prefix='.vaws-unit-', dir=path.parent))
+    descriptor, temporary = tempfile.mkstemp(prefix="vaws-diagnostics-", suffix=".service", dir=staging)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
@@ -207,12 +215,16 @@ def _publish(path, text, runner):
         # minimal systemd installations omit this optional inspection binary.
         analyzer = shutil.which("systemd-analyze")
         if analyzer:
-            _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
+            checked = _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
+            if checked.stderr.strip():
+                # Invalid non-fatal directives may be ignored with exit zero.
+                raise ServiceError('unit_verification_warning', action='unit.verify')
         os.replace(temporary, path)
         return "verified" if analyzer else "unavailable"
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+        staging.rmdir()
 
 
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
@@ -241,7 +253,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         existing = _read_owned(path)
         fixed_since = existing[1]["since"] if existing else _since(since)
         interpreter, version = _interpreter(runner, python)
-        _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None)
+        _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
+                            repair=existing is not None)
         argv = [str(interpreter), "-I", "-m", "vaws_diagnostics.cli", "worker"]
         for root in dict.fromkeys(roots):
             argv += ["--root", str(root)]
@@ -255,7 +268,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
                 "[Unit]\nDescription=VAWS local diagnostics reporter\nAfter=network-online.target\n"
                 "\n[Service]\nType=exec\nExecStart=" + " ".join(map(_quoted, argv)) + "\n"
                 "WorkingDirectory=/\n"
-                + ("EnvironmentFile=" + _quoted(environment_file).replace("$$", "$") + "\n" if environment_file else "") +
+                + ("EnvironmentFile=" + str(environment_file).replace('%', '%%') + "\n" if environment_file else "") +
                 "UnsetEnvironment=PYTHONPATH PYTHONHOME\nRestart=on-failure\nRestartSec=10\n"
                 "TimeoutStopSec=20\nKillMode=control-group\nUMask=0077\n"
                 "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=vaws-diagnostics\n"
@@ -310,7 +323,7 @@ def remove_service(*, unit_dir=None, runner=None):
         existing = _read_owned(path)
         if existing is None:
             return {"status": "absent", "unit": str(path)}
-        _check_loaded_owner(runner, path, allow_missing=True)
+        _check_loaded_owner(runner, path, allow_missing=True, repair=True)
         _systemctl(runner, "disable", "--now", UNIT)
         if _read_owned(path) != existing:
             raise ServiceError("unit_changed_during_removal")
