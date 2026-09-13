@@ -2,6 +2,7 @@ from contextlib import nullcontext
 from pathlib import Path
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -20,10 +21,15 @@ class Runner:
         self.state = "active"
         self.fragment = ""
         self.dropins = ""
+        self.verify_failure = False
 
     def __call__(self, argv, **options):
         self.calls.append((argv, options))
         assert options == {"capture_output": True, "text": True, "encoding": "utf-8", "timeout": 30, "check": False}
+        if Path(argv[0]).name == "systemd-analyze":
+            assert argv[1:3] == ["verify", "--man=no"]
+            assert Path(argv[3]).suffix == '.service' and Path(argv[3]).is_file()
+            return subprocess.CompletedProcess(argv, int(self.verify_failure), '', '')
         if argv[0] != "systemctl":
             assert argv[1:3] == ["-I", "-c"]
             facts = {"prefix": str(self.prefix), "base": "/base-python", "version": "0.1.0",
@@ -74,7 +80,8 @@ def test_install_uses_literal_arguments_immutable_python_and_bounded_journal(ins
     assert 'UnsetEnvironment=PYTHONPATH PYTHONHOME' in text
     assert 'LogRateLimitIntervalSec=30s' in text and 'LogRateLimitBurst=100' in text
     assert 'Restart=on-failure' in text and 'KillMode=control-group' in text
-    assert all(call[0][0] in {str(values['python']), 'systemctl'} for call in runner.calls)
+    assert '\nWorkingDirectory=/\n' in text
+    assert all(call[0][0] in {str(values['python']), 'systemctl'} or Path(call[0][0]).name == 'systemd-analyze' for call in runner.calls)
     assert [call[0][2] for call in runner.calls if call[0][0] == 'systemctl'] == ['show', 'daemon-reload', 'enable', 'show', 'start']
     assert result['since'] == '2026-09-13T01:02:03Z' or result['since'] == '2026-09-13T01:02:03+00:00'
 
@@ -230,3 +237,58 @@ def test_install_lock_has_stable_inode_and_no_shared_state_deletion(tmp_path):
         inode = (tmp_path / '.vaws-diagnostics-service.lock').stat().st_ino
     with service._locked(path):
         assert (tmp_path / '.vaws-diagnostics-service.lock').stat().st_ino == inode
+
+
+def test_rejected_staging_unit_preserves_existing_unit_and_never_reloads(install, monkeypatch):
+    values, runner = install
+    original_which = service.shutil.which
+    monkeypatch.setattr(service.shutil, 'which', lambda name: '/test/systemd-analyze' if name == 'systemd-analyze' else original_which(name))
+    result = service.install_service(**values)
+    assert result['unit_verification'] == 'verified'
+    previous = Path(result['unit']).read_bytes()
+    runner.calls.clear()
+    runner.verify_failure = True
+    with pytest.raises(service.ServiceError, match='command_failed') as failure:
+        service.install_service(**{**values, 'interval': 120})
+    assert failure.value.action == 'unit.verify'
+    assert Path(result['unit']).read_bytes() == previous
+    assert [call[0][2] for call in runner.calls if call[0][0] == 'systemctl'] == ['show']
+    assert not list(values['unit_dir'].glob('.vaws-diagnostics-*.service'))
+
+
+def test_missing_optional_unit_analyzer_is_reported_without_installing_it(install, monkeypatch):
+    values, runner = install
+    monkeypatch.setattr(service.shutil, 'which', lambda name: None)
+    result = service.install_service(**values)
+    assert result['unit_verification'] == 'unavailable'
+    assert Path(result['unit']).is_file()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='actual Linux systemd unit parser')
+def test_generated_unit_is_accepted_by_actual_systemd_analyze_and_old_workdir_rejected(install, tmp_path):
+    analyzer = shutil.which('systemd-analyze')
+    if analyzer is None:
+        pytest.skip('systemd-analyze is not installed on this Linux platform')
+    values, stub = install
+    # The verifier requires an executable, but does not execute it. Keep the
+    # actual service manager stubbed; only the static unit parser is real.
+    values['python'] = Path(sys.executable)
+    values['gh'] = Path(sys.executable)
+    replies = []
+    def runner(argv, **options):
+        if Path(argv[0]).name == 'systemd-analyze':
+            reply = subprocess.run(argv, **options)
+            replies.append(reply)
+            assert reply.returncode == 0, reply.stderr
+            return reply
+        return stub(argv, **options)
+    values['runner'] = runner
+    result = service.install_service(**values)
+    assert result['unit_verification'] == 'verified' and len(replies) == 1
+    text = Path(result['unit']).read_text()
+    invalid = tmp_path / 'old-workdir.service'
+    invalid.write_text(text.replace('WorkingDirectory=/', 'WorkingDirectory="/tmp/old state"'))
+    old = subprocess.run([analyzer, 'verify', '--man=no', str(invalid)],
+                         capture_output=True, text=True, timeout=30, check=False)
+    assert old.returncode != 0
+    assert 'WorkingDirectory' in old.stderr and 'not absolute' in old.stderr
