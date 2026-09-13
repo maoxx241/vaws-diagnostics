@@ -149,7 +149,10 @@ def enqueue_issues(github: GitHub, queue: Outbox, *, pages: int = 5) -> int:
 
 
 def diagnose_one(queue: Outbox, github: GitHub, grok: Grok) -> dict[str, Any]:
-    item = queue.claim(lease_seconds=300)
+    # Cover reconciliation, both inspections, generation and publication;
+    # begin_post still fences an expired lease before any mutation.
+    item = queue.claim(lease_seconds=21 * getattr(github, 'timeout', 30) +
+                       60 + getattr(grok, 'timeout', 180) + 60)
     if not item:
         return {"status": "idle"}
     marker = f"<!-- vaws-grok-diagnosis:{item['fingerprint']} -->"

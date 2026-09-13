@@ -10,12 +10,18 @@ _FILE = re.compile(r"\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 
 
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
-          max_age_days: int = 7, max_files: int = 512, clock=time.time) -> dict:
+          max_age_days: int = 7, max_files: int = 512, clock=time.time, queue=None) -> dict:
     root = Path(root).absolute()
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise ValueError("retention root must not traverse symlinks")
     events = root / 'events'
-    result = {"removed_files": 0, "removed_bytes": 0, "remaining_bytes": 0, "limited": False}
+    result = {"removed_files": 0, "removed_bytes": 0, "remaining_bytes": 0, "limited": False,
+              "unread_files": 0}
+    cursors = None
+    if queue is not None:
+        with queue.connect() as db:
+            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cursors'").fetchone()
+            cursors = {row['path']: dict(row) for row in db.execute('SELECT * FROM cursors')} if exists else {}
     if not events.is_dir() or events.is_symlink():
         return result
     files, visited = [], 0
@@ -44,6 +50,11 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
                 break
     total, remaining, now = sum(row[1] for row in files), len(files), clock()
     for modified, size, path, inode in sorted(files):
+        if cursors is not None:
+            cursor = cursors.get(str(path), {})
+            if cursor.get('inode') != str(inode) or cursor.get('offset', 0) < size:
+                result['unread_files'] += 1
+                continue  # Bounded ingestion/backpressure must not erase pending evidence.
         if now - modified < 300:
             continue  # Allow current writers and just-generated evidence to settle.
         if now - modified <= max_age_days * 86400 and total <= max_bytes and remaining <= max_files:

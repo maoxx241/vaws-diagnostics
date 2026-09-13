@@ -126,7 +126,8 @@ class GitHub:
 
 
 def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
-    item = queue.claim()
+    # Cover twenty bounded reconciliation pages, publication and local work.
+    item = queue.claim(lease_seconds=21 * getattr(github, 'timeout', 30) + 60)
     if not item:
         return {"status": "idle"}
     try:

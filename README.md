@@ -47,6 +47,13 @@ times from different clock identifiers or add parallel phases into elapsed time.
 File errors produce one bounded stderr warning and a `logging_failed` flag; they
 cannot mask the business result or prevent cleanup. stderr is never MCP stdout.
 
+Long-lived service backends can wrap their own main function with
+`capture_output(operation)`. The existing process drains native stdout/stderr
+into the same rotating sink; no new service owner or launcher is introduced.
+Complete lines are redacted before truncation. Oversized or incomplete lines
+produce explicit gap records instead of exporting potentially partial secrets.
+Do not use process-wide FD capture around concurrent MCP request handlers.
+
 ## Inspect or attach diagnostics
 
 ```sh
@@ -92,6 +99,30 @@ same timestamp across restarts; it does not delete older local evidence.
 Run it as the user whose tools produce these logs, with that user's GitHub login.
 Do not put tokens in command arguments, repository files or diagnostic bundles.
 
+For continuous Linux/WSL operation, install the package into a permanent,
+non-editable virtual environment, then explicitly enable its user service:
+
+```sh
+/path/to/venv/bin/vaws-diagnostics service install --root /path/to/diagnostics --state /path/to/reporter-state
+/path/to/venv/bin/vaws-diagnostics service status
+```
+
+The owned systemd unit restarts after failure, clears Python source overrides,
+uses a private umask and rate-limits its journal. Reinstallation preserves the
+initial observation timestamp. Add the same `--grok`, `--grok-home` and
+`--grok-work` options to include diagnosis. `--environment-file` accepts an
+explicit private 0600 file when the service needs credentials outside an
+interactive login. The installer never reads its contents or copies credentials
+into a unit. It refuses unrelated units, editable packages and system Python.
+`service remove` stops only this unit and preserves logs and queues.
+
+The service manager must run while observation is wanted. Linux installations
+may enable user lingering through their administrator. On Windows the worker
+can run in WSL; a login Task Scheduler action can start the WSL user service.
+Native Windows/macOS installations may schedule `worker --once` with their own
+service manager. The built-in service installer explicitly reports unsupported
+platforms rather than claiming it installed a native service there.
+
 ```sh
 vaws-diagnostics status --state /path/to/reporter-state
 ```
@@ -99,12 +130,21 @@ vaws-diagnostics status --state /path/to/reporter-state
 The outbox keeps immutable sanitized evidence, occurrence counts, publication
 state and last error. It deduplicates by component, version, operation, failing
 phase and error fingerprint. Byte cursors survive worker restarts; deduplication
-also handles rereading rotated segments. The queue is capped at 1,000 incidents,
+also handles rereading rotated segments. The queue is capped at 1,000 unpublished incidents,
 with a maximum of 10 issue submissions per hour. Full queues retain existing
 incidents and expose backpressure. Published records and occurrence identifiers
-expire after 30 days. Worker retention removes settled log segments beyond seven
+expire after 30 days. Published history is separately bounded to 1,000 records;
+the oldest published history and occurrence IDs can expire earlier at capacity.
+An expired local marker still goes through GitHub reconciliation before any POST.
+Worker retention removes settled log segments beyond seven
 days, 128 MiB or 512 files, preserving files modified in the last five minutes;
-`limited` reports when recent writers prevent meeting the retention target.
+unread segments remain until ingestion catches up. `limited` and `unread_files`
+report when writers or intake backpressure prevent meeting the retention target.
+An intake failure does not stop already queued issues or diagnoses from draining.
+
+`status` also reads the worker's atomic heartbeat, current stage, last cycle and
+degraded state. A stale heartbeat and a live process making no progress are
+reported separately. Heartbeats never claim GitHub publication succeeded.
 
 GitHub errors back off. A POST timeout or a crash after starting a POST is
 **uncertain**, not proof that creation failed. The next attempt searches direct

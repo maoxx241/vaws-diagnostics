@@ -1,0 +1,232 @@
+from contextlib import nullcontext
+from pathlib import Path
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
+from vaws_diagnostics import service
+
+
+class Runner:
+    def __init__(self, prefix):
+        self.prefix = prefix
+        self.calls = []
+        self.editable = False
+        self.fail = None
+        self.timeout = None
+        self.state = "active"
+        self.fragment = ""
+        self.dropins = ""
+
+    def __call__(self, argv, **options):
+        self.calls.append((argv, options))
+        assert options == {"capture_output": True, "text": True, "encoding": "utf-8", "timeout": 30, "check": False}
+        if argv[0] != "systemctl":
+            assert argv[1:3] == ["-I", "-c"]
+            facts = {"prefix": str(self.prefix), "base": "/base-python", "version": "0.1.0",
+                     "editable": self.editable, "package": str(self.prefix / "lib/vaws_diagnostics")}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(facts), "")
+        if argv[2] == self.timeout:
+            raise subprocess.TimeoutExpired(argv, 30)
+        if argv[2] == self.fail:
+            return subprocess.CompletedProcess(argv, 1, "", "private raw failure never copied")
+        if argv[2] == "show":
+            load = 'loaded' if Path(self.fragment).is_file() else 'not-found'
+            return subprocess.CompletedProcess(argv, 0,
+                f"LoadState={load}\nActiveState={self.state}\nSubState=running\nUnitFileState=enabled\nFragmentPath={self.fragment}\nDropInPaths={self.dropins}\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+@pytest.fixture
+def install(tmp_path, monkeypatch):
+    # Unit construction is tested on every platform without touching its real
+    # service manager. Actual Linux locking gets its own test below.
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service, "_locked", lambda path: (path.parent.mkdir(parents=True, exist_ok=True), nullcontext())[1])
+    prefix = tmp_path / 'immutable env % $HOME;not-a-shell'
+    python = prefix / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"fixture")
+    python.chmod(0o700)
+    gh = tmp_path / "Windows tools/gh.exe"
+    gh.parent.mkdir()
+    gh.write_bytes(b"fixture")
+    gh.chmod(0o700)
+    runner = Runner(prefix)
+    values = {"roots": [tmp_path / 'logs %u "quoted" $TOKEN; echo secret'],
+              "state": tmp_path / 'state %u $HOME', "repository": "example/repository",
+              "python": python, "gh": gh, "unit_dir": tmp_path / "user units", "runner": runner,
+              "since": "2026-09-13T01:02:03Z"}
+    runner.fragment = str(values['unit_dir'] / service.UNIT)
+    return values, runner
+
+
+def test_install_uses_literal_arguments_immutable_python_and_bounded_journal(install):
+    values, runner = install
+    result = service.install_service(**values)
+    text = Path(result["unit"]).read_text()
+    assert text.startswith(service.MARKER)
+    assert '%%u' in text and '$$TOKEN' in text and '\\"quoted\\"' in text
+    assert '"-I" "-m" "vaws_diagnostics.cli" "worker"' in text
+    assert 'UnsetEnvironment=PYTHONPATH PYTHONHOME' in text
+    assert 'LogRateLimitIntervalSec=30s' in text and 'LogRateLimitBurst=100' in text
+    assert 'Restart=on-failure' in text and 'KillMode=control-group' in text
+    assert all(call[0][0] in {str(values['python']), 'systemctl'} for call in runner.calls)
+    assert [call[0][2] for call in runner.calls if call[0][0] == 'systemctl'] == ['show', 'daemon-reload', 'enable', 'show', 'start']
+    assert result['since'] == '2026-09-13T01:02:03Z' or result['since'] == '2026-09-13T01:02:03+00:00'
+
+
+def test_reinstall_preserves_original_since_and_only_restarts_changed_config(install):
+    values, runner = install
+    first = service.install_service(**values)
+    path = Path(first['unit'])
+    previous = path.read_bytes()
+    runner.calls.clear()
+    second = service.install_service(**{**values, 'since': '2030-01-01T00:00:00Z'})
+    assert second['since'] == first['since'] and not second['changed']
+    assert path.read_bytes() == previous
+    assert runner.calls[-1][0][-2:] == ['start', service.UNIT]
+    third = service.install_service(**{**values, 'interval': 120})
+    assert third['changed'] and third['since'] == first['since']
+    assert runner.calls[-1][0][-2:] == ['restart', service.UNIT]
+    previous = path.read_bytes()
+    started = service.start_service(unit_dir=values['unit_dir'], runner=runner)
+    assert started['since'] == first['since'] and path.read_bytes() == previous
+
+
+def test_personal_unit_is_never_overwritten_or_stopped(install):
+    values, runner = install
+    path = values['unit_dir'] / service.UNIT
+    path.parent.mkdir(parents=True)
+    original = b'[Service]\nExecStart=/personal/worker\n'
+    path.write_bytes(original)
+    with pytest.raises(service.ServiceError, match='unowned_unit'):
+        service.install_service(**values)
+    with pytest.raises(service.ServiceError, match='unowned_unit'):
+        service.remove_service(unit_dir=path.parent, runner=runner)
+    assert path.read_bytes() == original and runner.calls == []
+
+
+def test_editable_or_base_python_is_not_installed_in_unit(install):
+    values, runner = install
+    runner.editable = True
+    with pytest.raises(service.ServiceError, match='installed_venv_required'):
+        service.install_service(**values)
+    assert not (values['unit_dir'] / service.UNIT).exists()
+    assert not any(call[0][0] == 'systemctl' for call in runner.calls)
+
+
+def test_remove_only_owned_unit_preserves_state_and_other_configuration(install):
+    values, runner = install
+    installed = service.install_service(**values)
+    state_file = values['state'] / 'reporter.sqlite3'
+    state_file.write_bytes(b'preserved private state')
+    other = values['unit_dir'] / 'personal.service'
+    other.write_bytes(b'personal configuration')
+    runner.calls.clear()
+    result = service.remove_service(unit_dir=values['unit_dir'], runner=runner)
+    assert result['status'] == 'removed' and result['state_preserved']
+    assert not Path(installed['unit']).exists()
+    assert state_file.read_bytes() == b'preserved private state'
+    assert other.read_bytes() == b'personal configuration'
+    assert runner.calls[1][0] == ['systemctl', '--user', 'disable', '--now', service.UNIT]
+    assert service.remove_service(unit_dir=values['unit_dir'], runner=runner)['status'] == 'absent'
+
+
+def test_unknown_stop_result_preserves_unit_without_retry(install):
+    values, runner = install
+    installed = service.install_service(**values)
+    runner.calls.clear()
+    runner.timeout = 'disable'
+    with pytest.raises(service.ServiceError, match='command_timeout'):
+        service.remove_service(unit_dir=values['unit_dir'], runner=runner)
+    assert Path(installed['unit']).is_file()
+    assert len(runner.calls) == 2
+
+
+def test_status_reports_observed_state_and_no_cleanup(install):
+    values, runner = install
+    service.install_service(**values)
+    runner.calls.clear()
+    runner.state = 'failed'
+    result = service.service_status(unit_dir=values['unit_dir'], runner=runner)
+    assert result['status'] == 'failed' and len(runner.calls) == 1
+    assert runner.calls[0][0][2] == 'show'
+
+
+def test_grok_profile_is_explicit_and_personal_files_remain_untouched(install, tmp_path):
+    values, runner = install
+    with pytest.raises(service.ServiceError, match='grok_profile_required'):
+        service.install_service(**values, grok=values['gh'])
+    profile = tmp_path / 'grok home'
+    profile.mkdir()
+    config = profile / 'config.json'
+    config.write_text('personal credentials unchanged')
+    result = service.install_service(**values, grok=values['gh'], grok_home=profile,
+                                     grok_work=tmp_path / 'grok work')
+    assert config.read_text() == 'personal credentials unchanged'
+    assert '"--grok-home"' in Path(result['unit']).read_text()
+
+
+@pytest.mark.parametrize('change', [{'roots': []}, {'roots': ['relative']}, {'state': 'relative'},
+                                    {'repository': 'bad\nExecStart=/anything'}, {'since': 'tomorrow'},
+                                    {'interval': float('nan')}, {'interval': 0}])
+def test_invalid_configuration_does_not_call_systemctl(install, change):
+    values, runner = install
+    with pytest.raises(service.ServiceError):
+        service.install_service(**{**values, **change})
+    assert not any(call[0][0] == 'systemctl' for call in runner.calls)
+
+
+def test_unsupported_platform_is_explicit(monkeypatch):
+    monkeypatch.setattr(service.sys, 'platform', 'win32')
+    for action in (lambda: service.install_service([], '/state', 'example/repository'),
+                   service.service_status, service.remove_service):
+        with pytest.raises(service.ServiceError, match='unsupported_platform'):
+            action()
+
+
+@pytest.mark.parametrize('changed', ['fragment', 'dropins'])
+def test_loaded_personal_unit_or_dropin_is_not_started_or_stopped(install, changed):
+    values, runner = install
+    setattr(runner, changed, '/personal/' + ('other.service' if changed == 'fragment' else 'override.conf'))
+    with pytest.raises(service.ServiceError, match='unowned_'):
+        service.install_service(**values)
+    assert not (values['unit_dir'] / service.UNIT).exists()
+    assert not any(call[0][2] in {'start', 'restart'} for call in runner.calls if call[0][0] == 'systemctl')
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX file permission contract')
+def test_environment_file_requires_private_regular_owned_file_without_reading_contents(install, tmp_path, monkeypatch):
+    values, runner = install
+    secret = tmp_path / 'github.env'
+    secret.write_text('GH_TOKEN=fixture-never-copy\nWSLENV=GH_TOKEN/w\n')
+    secret.chmod(0o644)
+    with pytest.raises(service.ServiceError, match='unsafe_environment_file'):
+        service.install_service(**values, environment_file=secret)
+    secret.chmod(0o600)
+    original_read = Path.read_text
+    def guarded_read(path, *args, **kwargs):
+        if path == secret:
+            raise AssertionError('installer must not read credentials')
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', guarded_read)
+    installed = service.install_service(**values, environment_file=secret)
+    unit = Path(installed['unit']).read_text()
+    assert 'EnvironmentFile=' in unit and 'fixture-never-copy' not in unit
+    link = tmp_path / 'linked.env'
+    link.symlink_to(secret)
+    with pytest.raises(service.ServiceError, match='unsafe_environment_file'):
+        service.install_service(**values, environment_file=link)
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='Linux persistent flock')
+def test_install_lock_has_stable_inode_and_no_shared_state_deletion(tmp_path):
+    path = tmp_path / service.UNIT
+    with service._locked(path):
+        inode = (tmp_path / '.vaws-diagnostics-service.lock').stat().st_ino
+    with service._locked(path):
+        assert (tmp_path / '.vaws-diagnostics-service.lock').stat().st_ino == inode

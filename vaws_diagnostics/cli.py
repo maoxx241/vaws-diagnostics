@@ -12,6 +12,39 @@ from .outbox import Outbox
 from .reporter import DEFAULT_REPOSITORY, GitHub, ingest, publish_one
 
 
+def run_cycle(args, queue, github, recorder, health, grok=None, bot_queue=None, *, since=None):
+    """Independent stages: a full intake queue must still be able to drain."""
+    result = {'ingestion': [], 'retention': [], 'reporter': None, 'bot': None, 'status': 'ok'}
+    with recorder.operation('worker.cycle') as operation:
+        def attempt(stage, function):
+            health.update(status='running', stage=stage)
+            try:
+                with operation.phase(stage):
+                    value = function()
+                if value.get('status') in {'retry', 'uncertain', 'blocked', 'rate_limited'} or value.get('limited'):
+                    result['status'] = 'degraded'
+                    operation.event('WARNING', 'worker.stage_degraded', stage=stage,
+                                    error_code=value.get('error'))
+                return value
+            except Exception as exc:
+                result['status'] = 'degraded'
+                operation.fail('diagnostics', exception=exc)
+                return {'status': 'degraded', 'error_type': type(exc).__name__}
+
+        from .maintenance import prune
+        for root in args.root:
+            result['ingestion'].append(attempt('ingest', lambda: ingest(root, queue, since=since)))
+            result['retention'].append(attempt('retention', lambda: prune(root, queue=queue)))
+        result['reporter'] = attempt('report', lambda: publish_one(queue, github))
+        if grok and bot_queue:
+            from .bot import diagnose_one, enqueue_issues
+            # Intake failure must not prevent already queued diagnoses.
+            result['bot_ingestion'] = attempt('bot.ingest', lambda: {'enqueued': enqueue_issues(github, bot_queue)})
+            result['bot'] = attempt('diagnose', lambda: diagnose_one(bot_queue, github, grok))
+    health.update(status='idle' if result['status'] == 'ok' else 'degraded', stage='waiting', last_cycle=result)
+    return result
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="vaws-diagnostics", description="Local diagnostics and independently enabled automatic issue reporting")
     sub = result.add_subparsers(dest="command", required=True)
@@ -23,6 +56,23 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--state", required=True)
     profile = sub.add_parser("grok-profile", help="create a dedicated tool-disabled Grok profile; existing personal config is never replaced")
     profile.add_argument("--home", required=True)
+    service = sub.add_parser('service', help='explicitly install, inspect or remove a supervised Linux user worker')
+    service_sub = service.add_subparsers(dest='action', required=True)
+    install = service_sub.add_parser('install')
+    install.add_argument('--root', action='append', required=True)
+    install.add_argument('--state', required=True)
+    install.add_argument('--repository', default=DEFAULT_REPOSITORY)
+    install.add_argument('--python')
+    install.add_argument('--gh')
+    install.add_argument('--grok')
+    install.add_argument('--grok-home')
+    install.add_argument('--grok-work')
+    install.add_argument('--interval', type=float, default=60)
+    install.add_argument('--since')
+    install.add_argument('--environment-file', help='optional private 0600 systemd environment file; contents are never logged')
+    install.add_argument('--no-start', action='store_true')
+    service_sub.add_parser('status')
+    service_sub.add_parser('remove')
     worker = sub.add_parser("worker", help="enable local failure reporting and optional Grok diagnosis")
     worker.add_argument("--root", action="append", required=True, help="explicit diagnostic root; repeat for multiple components/workspaces")
     worker.add_argument("--state", required=True)
@@ -39,6 +89,22 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == 'service':
+        from .service import install_service, service_status, remove_service, ServiceError
+        try:
+            if args.action == 'install':
+                result = install_service(args.root, args.state, args.repository, python=args.python, gh=args.gh,
+                                         grok=args.grok, grok_home=args.grok_home, grok_work=args.grok_work,
+                                         interval=args.interval, since=args.since, environment_file=args.environment_file,
+                                         start=not args.no_start)
+            else:
+                result = service_status() if args.action == 'status' else remove_service()
+        except ServiceError as exc:
+            print(json.dumps({'status': 'error', 'category': exc.category, 'action': exc.action,
+                              'returncode': exc.returncode}), flush=True)
+            return 1
+        print(json.dumps(result, ensure_ascii=True))
+        return 0
     if args.command == "bundle":
         from .bundle import collect_bundle
         print(json.dumps(collect_bundle(args.root, operation_id=args.operation_id, output=args.output), ensure_ascii=True))
@@ -50,7 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     state = Path(args.state).resolve()
     if args.command == "status":
-        result = {}
+        from .health import read_health
+        result = {'worker': read_health(state)}
         for name in ("reporter", "bot"):
             path = state / f"{name}.sqlite3"
             result[name] = Outbox(path).rows() if path.exists() else []
@@ -79,37 +146,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.grok:
         from .bot import Grok
         grok, bot_queue = Grok(args.grok, home=args.grok_home, work=args.grok_work), Outbox(state / "bot.sqlite3")
-    while not stop.is_set():
-        result = {"ingestion": [], "reporter": None, "bot": None}
-        try:
-            with recorder.operation("worker.cycle") as op:
-                for root in args.root:
-                    with op.phase("ingest"):
-                        result["ingestion"].append(ingest(root, queue, since=since))
-                    from .maintenance import prune
-                    with op.phase("retention"):
-                        op.event("INFO", "retention.complete", **prune(root))
-                with op.phase("report"):
-                    result["reporter"] = publish_one(queue, github)
-                    op.event('WARNING' if result['reporter']['status'] in {'retry', 'uncertain', 'blocked', 'rate_limited'} else 'INFO',
-                             'reporter.result', status=result['reporter']['status'], error_code=result['reporter'].get('error'))
-                if grok and bot_queue:
-                    from .bot import diagnose_one, enqueue_issues
-                    with op.phase("diagnose"):
-                        enqueue_issues(github, bot_queue)
-                        result["bot"] = diagnose_one(bot_queue, github, grok)
-                        op.event('WARNING' if result['bot']['status'] in {'retry', 'uncertain', 'blocked', 'rate_limited'} else 'INFO',
-                                 'bot.result', status=result['bot']['status'], error_code=result['bot'].get('error'))
+    from .health import Health
+    with Health(state, recorder, interval=args.interval) as health:
+        while not stop.is_set():
+            result = run_cycle(args, queue, github, recorder, health, grok, bot_queue, since=since)
             print(json.dumps(result, ensure_ascii=True), flush=True)
-        except Exception as exc:
-            # Operation context already records the local exception. Do not copy
-            # credentials or raw subprocess errors into scheduler console logs.
-            print(json.dumps({"status": "degraded", "error_type": type(exc).__name__}), flush=True)
             if args.once:
-                return 1
-        if args.once:
-            return 0
-        stop.wait(args.interval)
+                return int(result['status'] != 'ok')
+            stop.wait(args.interval)
     return 0
 
 

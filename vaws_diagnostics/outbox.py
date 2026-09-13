@@ -1,4 +1,9 @@
-"""Bounded publishing queue. Never an execution or resource ownership ledger."""
+"""Bounded publishing queue. Never an execution or resource ownership ledger.
+
+Pending evidence and already-public history each have their own capacity.
+Operation dedup retains at most 30 days / 20 times capacity, whichever is less;
+after that bounded lookback, publication still reconciles the GitHub marker.
+"""
 from __future__ import annotations
 
 import json
@@ -57,20 +62,29 @@ class Outbox:
             db.execute("DELETE FROM seen WHERE observed < ?", (now - 30 * 86400,))
             db.execute("DELETE FROM publications WHERE at < ?", (now - 86400,))
             db.execute("DELETE FROM generations WHERE at < ?", (now - 86400,))
-            db.execute("DELETE FROM incidents WHERE state='published' AND last_seen < ?", (now - 30 * 86400,))
+            self._prune_published(db, now)
             if db.execute("SELECT 1 FROM seen WHERE operation_id=?", (operation_id,)).fetchone():
                 return False
-            if db.execute("SELECT COUNT(*) FROM seen").fetchone()[0] >= self.capacity * 20:
-                raise QueueFull("diagnostic dedup capacity reached; retained incidents were not discarded")
             existing = db.execute("SELECT 1 FROM incidents WHERE fingerprint=?", (fingerprint,)).fetchone()
             if existing:
                 db.execute("UPDATE incidents SET last_seen=?, occurrences=occurrences+1 WHERE fingerprint=?", (now, fingerprint))
             else:
-                if db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] >= self.capacity:
+                if db.execute("SELECT COUNT(*) FROM incidents WHERE state!='published'").fetchone()[0] >= self.capacity:
                     raise QueueFull("diagnostic outbox is full; retained incidents were not discarded")
                 db.execute("INSERT INTO incidents (fingerprint,payload,first_seen,last_seen) VALUES (?,?,?,?)", (fingerprint, body, now, now))
             db.execute("INSERT INTO seen VALUES (?,?)", (operation_id, now))
+            db.execute("DELETE FROM seen WHERE operation_id IN "
+                       "(SELECT operation_id FROM seen ORDER BY observed DESC, operation_id DESC LIMIT -1 OFFSET ?)",
+                       (self.capacity * 20,))
         return True
+
+    def _prune_published(self, db, now):
+        # Completed public records are recoverable from their remote markers;
+        # unpublished evidence must never be evicted to make intake space.
+        db.execute("DELETE FROM incidents WHERE state='published' AND last_seen < ?", (now - 30 * 86400,))
+        db.execute("DELETE FROM incidents WHERE fingerprint IN "
+                   "(SELECT fingerprint FROM incidents WHERE state='published' "
+                   "ORDER BY last_seen DESC, fingerprint DESC LIMIT -1 OFFSET ?)", (self.capacity,))
 
     def claim(self, *, lease_seconds: float = 300) -> dict[str, Any] | None:
         now, token = self.clock(), uuid.uuid4().hex
@@ -91,6 +105,7 @@ class Outbox:
             cursor = db.execute("UPDATE incidents SET " + ",".join(f"{key}=?" for key in fields) + ",lease_until=0,lease_token=NULL WHERE fingerprint=? AND lease_token=?", (*fields.values(), item["fingerprint"], item["lease_token"]))
             if cursor.rowcount != 1:
                 raise RuntimeError("diagnostic worker lease lost")
+            self._prune_published(db, self.clock())
 
     def begin_post(self, item: dict[str, Any], *, hourly_limit: int = 10) -> bool:
         """Persist uncertainty BEFORE a mutating request, including process death."""
@@ -122,7 +137,7 @@ class Outbox:
 
     def rows(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT fingerprint,first_seen,last_seen,occurrences,state,attempts,next_attempt,issue_number,issue_url,last_error,diagnosis_state FROM incidents ORDER BY last_seen DESC LIMIT ?", (self.capacity,))]
+            return [dict(row) for row in db.execute("SELECT fingerprint,first_seen,last_seen,occurrences,state,attempts,next_attempt,issue_number,issue_url,last_error,diagnosis_state FROM incidents ORDER BY (state='published'),last_seen DESC LIMIT ?", (self.capacity * 2,))]
 
     def published(self, *, limit: int = 10) -> list[dict[str, Any]]:
         with self.connect() as db:

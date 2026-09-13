@@ -64,8 +64,8 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
         if size < offset:
             offset = 0
         if size > offset:
-            candidates.append((cursor.get('touched', 0), modified, path, offset, cursor.get('discard', 0) if offset else 0))
-    for _, _, path, offset, discard in sorted(candidates):
+            candidates.append((cursor.get('touched', 0), modified, path, str(inode), offset, cursor.get('discard', 0) if offset else 0))
+    for _, _, path, candidate_identity, offset, discard in sorted(candidates):
         if counts['files'] >= max_files or counts['scanned_bytes'] >= max_bytes:
             counts['limited'] = 1
             break
@@ -73,6 +73,10 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
         recent = deque(maxlen=100)
         with _safe_open(path) as stream:
             identity = str(os.fstat(stream.fileno()).st_ino)
+            # Rotation can replace the path after candidate discovery. Offsets
+            # and oversized-line state belong to the inode actually observed.
+            if identity != candidate_identity:
+                offset, discard = 0, 0
             stream.seek(offset)
             while counts['scanned_bytes'] < max_bytes:
                 start = stream.tell()
