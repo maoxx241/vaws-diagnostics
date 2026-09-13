@@ -193,16 +193,23 @@ def _locked(path):
         os.close(descriptor)
 
 
-def _publish(path, text):
+def _publish(path, text, runner):
     if len(text.encode("utf-8")) > MAX_UNIT_BYTES:
         raise ServiceError("unit_too_large")
-    descriptor, temporary = tempfile.mkstemp(prefix=".vaws-diagnostics-", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=".vaws-diagnostics-", suffix=".service", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        # Parse the exact staged file before replacing a working installation.
+        # This does not contact a service manager or execute ExecStart. Some
+        # minimal systemd installations omit this optional inspection binary.
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer:
+            _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
         os.replace(temporary, path)
+        return "verified" if analyzer else "unavailable"
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -247,7 +254,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         text = (MARKER + METADATA + json.dumps(metadata, separators=(",", ":")) + "\n"
                 "[Unit]\nDescription=VAWS local diagnostics reporter\nAfter=network-online.target\n"
                 "\n[Service]\nType=exec\nExecStart=" + " ".join(map(_quoted, argv)) + "\n"
-                "WorkingDirectory=" + _quoted(state).replace("$$", "$") + "\n"
+                "WorkingDirectory=/\n"
                 + ("EnvironmentFile=" + _quoted(environment_file).replace("$$", "$") + "\n" if environment_file else "") +
                 "UnsetEnvironment=PYTHONPATH PYTHONHOME\nRestart=on-failure\nRestartSec=10\n"
                 "TimeoutStopSec=20\nKillMode=control-group\nUMask=0077\n"
@@ -256,8 +263,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
                 "\n[Install]\nWantedBy=default.target\n")
         changed = existing is None or existing[0] != text
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if changed:
-            _publish(path, text)
+        verification = _publish(path, text, runner) if changed else "unchanged"
         _systemctl(runner, "daemon-reload")
         _systemctl(runner, "enable", str(path))
         _check_loaded_owner(runner, path)
@@ -265,7 +271,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
             _systemctl(runner, "restart" if existing and changed else "start", UNIT)
         return {"status": "installed", "unit": str(path), "since": fixed_since,
                 "changed": changed, "start_requested": start, "python": str(interpreter),
-                "package_version": version, "state": str(state)}
+                "package_version": version, "state": str(state), "unit_verification": verification}
 
 
 def service_status(*, unit_dir=None, runner=None):
